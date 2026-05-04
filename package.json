@@ -1,0 +1,19 @@
+{
+  "name": "local-agent",
+  "version": "1.0.0",
+  "description": "Local AI agent using Qwen3.5-0.8B via transformers.js + LangChain.js",
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "agent": "node src/index.js"
+  },
+  "dependencies": {
+    "@huggingface/transformers": "^4.0.0",
+    "@langchain/core": "^0.3.0",
+    "langchain": "^0.3.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
