@@ -4,7 +4,7 @@
  * Singleton pipeline loader with:
  *   - download progress reporting (per-file + aggregate %)
  *   - TextStreamer for token-by-token stdout output
- *   - device / dtype config (wasm = Node default, webgpu = browser/Node GPU)
+ *   - device / dtype config (cpu = Node default, webgpu = browser/Node GPU)
  *
  * This file has zero framework deps — only @huggingface/transformers.
  * It works identically in Node.js and the browser; the only change for
@@ -112,15 +112,16 @@ export async function loadModel({ model, dtype, device, cacheDir, onProgress } =
     process.stderr.write(`[model] dtype    ${dtype}   device  ${device}\n`);
   }
 
-  _pipe = await pipeline("text-generation", model, {
-    dtype,
-    device,
-    progress_callback: makeProgressCallback(onProgress),
-  });
-
-  // Attach TextStreamer factory so callers can build streamers without
-  // re-importing the library.
-  _pipe._TextStreamer = TextStreamer;
+  try {
+    _pipe = await pipeline("text-generation", model, {
+      dtype,
+      device,
+      progress_callback: makeProgressCallback(onProgress),
+    });
+  } catch (err) {
+    _pipe = null;   // reset so the next call can retry
+    throw err;
+  }
 
   return _pipe;
 }

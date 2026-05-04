@@ -1,29 +1,15 @@
 /**
  * src/core/agent.js
  *
- * Agent base class.
+ * Agent base class + agentic loop built purely on transformers.js v4.
+ * No framework deps — only @huggingface/transformers + your tools.
  *
- * Wraps the transformers.js v4 pipeline's native tool-calling API
- * (the `tools` param + `reply.tool_calls`) into a smolagents-style loop:
- *
- *   agent.run("query")
- *     → step 1: model decides to call tool(s)
- *     → tool result appended as { role: "tool", ... }
- *     → step 2: model reads result, either answers or calls another tool
- *     → ...
- *     → final text response returned
- *
- * Key design choices
- * ──────────────────
- * • Zero framework deps — only @huggingface/transformers + your tools.
- * • All state lives in `this.messages` (a plain array).
- * • `onStep` callback gives the caller full visibility into every step.
- *   Wire it to a UI, a logger, or ignore it.
- * • Streaming is opt-in via `opts.stream = true`.  In streaming mode each
- *   token is written to stdout (Node) or emitted via `onToken` (browser).
- * • Browser-portable: no Node-specific APIs outside the optional TTY logging.
+ * Streaming: opt-in via opts.stream = true.
+ * TextStreamer is imported directly from the library (top-level import),
+ * not smuggled through the pipeline object.
  */
 
+import { TextStreamer } from "@huggingface/transformers";
 import { loadModel } from "./model.js";
 
 // ── helpers ────────────────────────────────────────────────────────────────────
@@ -36,7 +22,6 @@ function log(label, text, verbose) {
 }
 
 function toolResultMessage(toolCallId, result) {
-  // transformers.js / OpenAI tool-result format
   return {
     role:         "tool",
     tool_call_id: toolCallId,
@@ -57,25 +42,25 @@ export class Agent {
    * @param {string}   [opts.systemPrompt]  override default system prompt
    * @param {number}   [opts.maxSteps]      max tool-call iterations (default 8)
    * @param {number}   [opts.maxNewTokens]  token budget per model call (default 512)
-   * @param {boolean}  [opts.verbose]       log Thought/Action/Observation
+   * @param {boolean}  [opts.verbose]       log step-by-step details
    * @param {boolean}  [opts.stream]        stream tokens to stdout / onToken
    * @param {Function} [opts.onStep]        called after every agent step
-   * @param {Function} [opts.onToken]       called with each streamed token string
+   * @param {Function} [opts.onToken]       called with each streamed token (browser)
    * @param {Function} [opts.onProgress]    called with model download progress events
    */
   constructor(opts = {}) {
-    this.model         = opts.model         ?? "onnx-community/Qwen3-0.6B-ONNX";
-    this.dtype         = opts.dtype         ?? "q4";
-    this.device        = opts.device        ?? "cpu";
-    this.cacheDir      = opts.cacheDir      ?? "./.cache";
-    this.maxSteps      = opts.maxSteps      ?? 8;
-    this.maxNewTokens  = opts.maxNewTokens  ?? 512;
-    this.verbose       = opts.verbose       ?? true;
-    this.stream        = opts.stream        ?? false;
-    this.onStep        = opts.onStep        ?? null;
-    this.onToken       = opts.onToken       ?? null;
-    this.onProgress    = opts.onProgress    ?? null;
-    this.systemPrompt  = opts.systemPrompt  ?? this._defaultSystemPrompt();
+    this.model        = opts.model        ?? "onnx-community/Qwen3-0.6B-ONNX";
+    this.dtype        = opts.dtype        ?? "q4";
+    this.device       = opts.device       ?? "cpu";
+    this.cacheDir     = opts.cacheDir     ?? "./.cache";
+    this.maxSteps     = opts.maxSteps     ?? 8;
+    this.maxNewTokens = opts.maxNewTokens ?? 512;
+    this.verbose      = opts.verbose      ?? true;
+    this.stream       = opts.stream       ?? false;
+    this.onStep       = opts.onStep       ?? null;
+    this.onToken      = opts.onToken      ?? null;
+    this.onProgress   = opts.onProgress   ?? null;
+    this.systemPrompt = opts.systemPrompt ?? this._defaultSystemPrompt();
 
     this.tools    = opts.tools ?? [];
     this._toolMap = Object.fromEntries(this.tools.map((t) => [t.name, t]));
@@ -84,7 +69,6 @@ export class Agent {
 
   // ── public API ───────────────────────────────────────────────────────────────
 
-  /** Initialise the model (called automatically by run() if needed). */
   async load() {
     if (this._pipe) return;
     this._pipe = await loadModel({
@@ -104,10 +88,10 @@ export class Agent {
   async run(query) {
     await this.load();
 
-    const toolSchemas  = this.tools.map((t) => t.toOpenAISchema());
-    const messages     = [
-      { role: "system",  content: this.systemPrompt },
-      { role: "user",    content: query },
+    const toolSchemas = this.tools.map((t) => t.toOpenAISchema());
+    const messages    = [
+      { role: "system", content: this.systemPrompt },
+      { role: "user",   content: query },
     ];
 
     log("User", query, this.verbose);
@@ -118,7 +102,7 @@ export class Agent {
       messages.push(reply);
       this.onStep?.({ step, reply, messages: [...messages] });
 
-      // ── text-only response → done ──────────────────────────────────────────
+      // text-only response → done
       if (!reply.tool_calls?.length) {
         const answer = typeof reply.content === "string"
           ? reply.content
@@ -127,7 +111,6 @@ export class Agent {
         return answer;
       }
 
-      // ── tool calls ─────────────────────────────────────────────────────────
       log(`Step ${step + 1} — Tool Calls`, JSON.stringify(reply.tool_calls, null, 2), this.verbose);
 
       for (const call of reply.tool_calls) {
@@ -144,7 +127,7 @@ export class Agent {
 
         log(`Tool: ${name}`, JSON.stringify(args), this.verbose);
         const result = await tool.run(args);
-        log(`Observation`, result, this.verbose);
+        log("Observation", result, this.verbose);
 
         messages.push(toolResultMessage(call.id ?? name, result));
       }
@@ -162,11 +145,12 @@ export class Agent {
       tools:          toolSchemas.length ? toolSchemas : undefined,
     };
 
-    // Streaming — attach a TextStreamer that writes tokens as they arrive.
-    // The streamer only fires for the text portion; tool-call tokens are
-    // emitted silently (the pipeline handles them internally).
-    if (this.stream && this._pipe._TextStreamer) {
-      const streamer = new this._pipe._TextStreamer(this._pipe.tokenizer, {
+    if (this.stream) {
+      // TextStreamer is imported at the top of this file — no smuggling needed.
+      // skip_special_tokens: true suppresses <|im_start|> etc.
+      // When tools are active the model may emit tool-call tokens silently;
+      // the streamer only fires on decoded text tokens.
+      const streamer = new TextStreamer(this._pipe.tokenizer, {
         skip_prompt:         true,
         skip_special_tokens: true,
         callback_function:   (token) => {
@@ -180,10 +164,7 @@ export class Agent {
       genOpts.streamer = streamer;
     }
 
-    const output = await this._pipe(messages, genOpts);
-
-    // output[0].generated_text is Array<{role, content, tool_calls?}>
-    // The last entry is the new assistant turn.
+    const output    = await this._pipe(messages, genOpts);
     const generated = output[0].generated_text;
     return generated[generated.length - 1];
   }
