@@ -1,65 +1,68 @@
 /**
  * src/index.js
  *
- * Entry point for the local ReAct agent.
+ * Demo entry point.
  *
  * Usage:
- *   node src/index.js                    # runs built-in demo queries
- *   node src/index.js "your question"    # single query from CLI arg
+ *   node src/index.js                        # run all demo queries
+ *   node src/index.js "your question here"   # single query
  *
- * Environment variables:
- *   MODEL_CACHE_DIR   - where to store ONNX weights (default: ./.cache)
- *   MODEL_DTYPE       - quantisation: q4 | q8 | fp32 (default: q4)
- *   MAX_NEW_TOKENS    - token budget per model call (default: 512)
- *   MAX_ITERATIONS    - agent reasoning steps (default: 8)
- *   VERBOSE           - set to "false" to suppress step-by-step logs
+ * Env vars:
+ *   MODEL            HF model id          (default: onnx-community/Qwen3-0.6B-ONNX)
+ *   DTYPE            quantisation         (default: q4)
+ *   DEVICE           wasm | webgpu        (default: wasm)
+ *   CACHE_DIR        local model cache    (default: ./.cache)
+ *   MAX_STEPS        agent iterations     (default: 8)
+ *   MAX_NEW_TOKENS   tokens per call      (default: 512)
+ *   VERBOSE          true | false         (default: true)
+ *   STREAM           stream tokens        (default: false)
  */
 
-import { TransformersJSChatModel } from "./llm.js";
-import { ReactAgent } from "./agent.js";
-import { ALL_TOOLS } from "./tools.js";
+import { Agent } from "./core/agent.js";
+import {
+  CalculatorTool,
+  DateTimeTool,
+  WikipediaTool,
+  WeatherTool,
+} from "./tools/index.js";
 
-// ── Config ─────────────────────────────────────────────────────────────────────
+// ── config ─────────────────────────────────────────────────────────────────────
 
 const CONFIG = {
-  model: "onnx-community/Qwen3.5-0.8B-ONNX",
-  dtype: process.env.MODEL_DTYPE ?? "q4",
-  cacheDir: process.env.MODEL_CACHE_DIR ?? "./.cache",
-  maxNewTokens: parseInt(process.env.MAX_NEW_TOKENS ?? "512", 10),
-  maxIterations: parseInt(process.env.MAX_ITERATIONS ?? "8", 10),
-  verbose: process.env.VERBOSE !== "false",
+  model:        process.env.MODEL         ?? "onnx-community/Qwen3-0.6B-ONNX",
+  dtype:        process.env.DTYPE         ?? "q4",
+  device:       process.env.DEVICE        ?? "cpu",
+  cacheDir:     process.env.CACHE_DIR     ?? "./.cache",
+  maxSteps:     Number(process.env.MAX_STEPS      ?? 8),
+  maxNewTokens: Number(process.env.MAX_NEW_TOKENS ?? 512),
+  verbose:      process.env.VERBOSE       !== "false",
+  stream:       process.env.STREAM        === "true",
 };
 
-// ── Demo queries ───────────────────────────────────────────────────────────────
+// ── demo queries ───────────────────────────────────────────────────────────────
 
 const DEMO_QUERIES = [
-  "What is the square root of 1764 plus 42?",
-  "What is today's date and time?",
-  "Give me a one-sentence summary of the Python programming language.",
-  "What is the weather like in São Paulo right now?",
-  "What is (17 * 23) - 144? Then tell me what the result squared is.",
+  "What is the square root of 1764, then add 42 to the result?",
+  "What time and date is it right now?",
+  "Give me a one-sentence summary of the Qwen language model family.",
+  "What is the weather like in Indaiatuba, São Paulo right now?",
+  "Calculate (17 * 23) - 144, then square that result.",
 ];
 
-// ── Main ───────────────────────────────────────────────────────────────────────
+// ── main ───────────────────────────────────────────────────────────────────────
 
 async function main() {
-  const llm = new TransformersJSChatModel({
-    model: CONFIG.model,
-    dtype: CONFIG.dtype,
-    cacheDir: CONFIG.cacheDir,
-    maxNewTokens: CONFIG.maxNewTokens,
-    doSample: false,
-    temperature: 0.1,
+  const agent = new Agent({
+    ...CONFIG,
+    tools: [
+      new CalculatorTool(),
+      new DateTimeTool(),
+      new WikipediaTool(),
+      new WeatherTool(),
+    ],
   });
 
-  const agent = new ReactAgent(llm, ALL_TOOLS, {
-    maxIterations: CONFIG.maxIterations,
-    verbose: CONFIG.verbose,
-  });
-
-  // CLI arg overrides demo queries
-  const cliQuery = process.argv[2];
-  const queries = cliQuery ? [cliQuery] : DEMO_QUERIES;
+  const queries = process.argv[2] ? [process.argv[2]] : DEMO_QUERIES;
 
   for (const query of queries) {
     const banner = "═".repeat(70);
@@ -69,14 +72,16 @@ async function main() {
 
     try {
       const answer = await agent.run(query);
-      console.log(`\n✓ ANSWER: ${answer}`);
+      if (CONFIG.stream) process.stdout.write("\n");
+      console.log(`\n✓ ${answer}`);
     } catch (err) {
       console.error(`✗ ERROR: ${err.message}`);
+      if (CONFIG.verbose) console.error(err.stack);
     }
   }
 }
 
 main().catch((err) => {
-  console.error("Fatal error:", err);
+  console.error("Fatal:", err);
   process.exit(1);
 });

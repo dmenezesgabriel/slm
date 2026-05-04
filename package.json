@@ -1,19 +1,16 @@
 {
-  "name": "local-agent",
+  "name": "tjs-agent",
   "version": "1.0.0",
-  "description": "Local AI agent using Qwen3.5-0.8B via transformers.js + LangChain.js",
+  "description": "Pure transformers.js v4 agent — no framework wrappers",
   "type": "module",
-  "main": "src/index.js",
   "scripts": {
     "start": "node src/index.js",
-    "agent": "node src/index.js"
+    "dev": "node --watch src/index.js"
   },
   "dependencies": {
-    "@huggingface/transformers": "^4.0.0",
-    "@langchain/core": "^0.3.0",
-    "langchain": "^0.3.0"
+    "@huggingface/transformers": "next",
+    "zod": "^3.23.8",
+    "zod-to-json-schema": "^3.23.5"
   },
-  "engines": {
-    "node": ">=18.0.0"
-  }
+  "engines": { "node": ">=18" }
 }
