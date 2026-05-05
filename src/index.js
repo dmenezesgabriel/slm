@@ -15,7 +15,7 @@
  *   MAX_STEPS        agent iterations     (default: 8)
  *   MAX_NEW_TOKENS   tokens per call      (default: 512)
  *   VERBOSE          true | false         (default: true)
- *   STREAM           stream tokens        (default: false)
+ *   STREAM           stream tokens        (default: true)
  *   THREADS          ONNX CPU threads     (default: 2)  — raise on machines with >8 GB RAM
  *   ENABLE_THINKING  true | false         (default: false) — Qwen3 chain-of-thought;
  *                    when true the full thinking block is available and the answer
@@ -42,7 +42,7 @@ const CONFIG = {
   maxSteps:        Number(process.env.MAX_STEPS        ?? 8),
   maxNewTokens:    Number(process.env.MAX_NEW_TOKENS   ?? 512),
   verbose:         process.env.VERBOSE          !== "false",
-  stream:          process.env.STREAM           === "true",
+  stream:          process.env.STREAM           !== "false",   // default ON
   threads:         Number(process.env.THREADS          ?? 2),
   // Qwen3 thinking mode.
   // When false (default) the Qwen3 template pre-fills <think>\n\n</think>\n\n,
