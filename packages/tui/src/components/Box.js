@@ -17,7 +17,8 @@ export class Box extends Component {
   }
 
   render(width) {
-    const bc       = this.borderColor;
+    if (width < 4) return ["[Box]"];
+    const bc    = this.borderColor;
     const rs       = style.reset;
     const inner    = width - 2;                     // inside the │ chars
     const padded   = inner - this.padding * 2;

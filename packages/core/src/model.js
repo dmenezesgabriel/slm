@@ -1,3 +1,9 @@
+import { homedir } from "os";
+import { join }    from "path";
+
+// Global cache shared across all projects, mirroring Python transformers' behaviour.
+const GLOBAL_CACHE_DIR = join(homedir(), ".transformers-js", ".cache");
+
 /**
  * src/core/model.js
  *
@@ -93,7 +99,7 @@ let _pipe = null;
  * @param {string}   opts.model       HF model id
  * @param {string}   opts.dtype       "q4" | "q4f16" | "fp32"
  * @param {string}   opts.device      "cpu" | "webgpu"
- * @param {string}   [opts.cacheDir]  local cache dir (Node only)
+ * @param {string}   [opts.cacheDir]  cache directory — defaults to ~/.transformers-js/.cache
  * @param {number}   [opts.threads]   ONNX CPU thread count (default: 2)
  * @param {Function} [opts.onProgress]
  */
@@ -101,7 +107,7 @@ export async function loadModel({
   model,
   dtype,
   device,
-  cacheDir,
+  cacheDir = GLOBAL_CACHE_DIR,
   threads = 2,       // ← cap threads to prevent VM freeze on 8 GB machines
   onProgress,
 } = {}) {

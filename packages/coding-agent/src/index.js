@@ -10,7 +10,7 @@
  *   MODEL           HF model id          (default: onnx-community/Qwen3-0.6B-ONNX)
  *   DTYPE           quantisation         (default: q4)
  *   DEVICE          cpu | webgpu         (default: cpu)
- *   CACHE_DIR       model cache path     (default: ./.cache)
+ *   CACHE_DIR       model cache path     (default: ~/.transformers-js/.cache)
  *   MAX_NEW_TOKENS  answer token budget  (default: 1024)
  *   THREADS         ONNX CPU threads     (default: 2)
  *   ENABLE_THINKING true | false         (default: false)
@@ -33,7 +33,7 @@ const CONFIG = {
   model:          process.env.MODEL            ?? "onnx-community/Qwen3-0.6B-ONNX",
   dtype:          process.env.DTYPE            ?? "q4",
   device:         process.env.DEVICE           ?? "cpu",
-  cacheDir:       process.env.CACHE_DIR        ?? "./.cache",
+  cacheDir:       process.env.CACHE_DIR,        // undefined → ~/.transformers-js/.cache
   maxNewTokens:   Number(process.env.MAX_NEW_TOKENS   ?? 1024),
   threads:        Number(process.env.THREADS          ?? 2),
   enableThinking: process.env.ENABLE_THINKING  === "true",
@@ -67,46 +67,91 @@ const acList    = new Autocomplete();
 // ── rendering ─────────────────────────────────────────────────────────────────
 
 function buildFrame(width, height) {
+  const W = Math.max(20, width);
+
+  // Layout (rows):
+  //   1          ─ header
+  //   convHeight ─ conversation  (anchored to top, empty rows pad bottom)
+  //   acRows     ─ autocomplete overlay
+  //   1          ─ blank padding   ← breathing room above separator
+  //   1          ─ separator
+  //   1          ─ input / processing indicator
+  //   1          ─ status bar (model info)   ← NEW, replaces terminal-edge glue
+  // total = 1 + convHeight + acRows + 6 = height
+
+  const BOTTOM = 6; // blank + sep + input + sep + status + empty line
+
+  const maxAC  = Math.max(0, Math.floor((height - 1 - BOTTOM) / 2));
+  const acRows = (acList.visible && !processing)
+    ? Math.min(acList.items.length, maxAC, 5)
+    : 0;
+
+  const convHeight = Math.max(0, height - 1 - BOTTOM - acRows);
+
   const lines = [];
 
-  // ── header (1 row) ──────────────────────────────────────────────────────────
-  const title  = ` SLMS Coding Agent  ${CONFIG.model} `;
-  const hFill  = "─".repeat(Math.max(0, width - strip(title).length - 2));
-  lines.push(ansi.color.brightCyan + "─" + title + hFill + "─" + ansi.style.reset);
+  // ── header ────────────────────────────────────────────────────────
+  const fullTitle  = ` SLMS Coding Agent  ${CONFIG.model} `;
+  const shortTitle = ` SLMS Coding Agent `;
+  const titleStr   = strip(fullTitle).length + 2 <= W ? fullTitle : shortTitle;
+  const hFill      = "─".repeat(Math.max(0, W - strip(titleStr).length - 2));
+  lines.push(ansi.color.brightCyan + "─" + titleStr + hFill + "─" + ansi.style.reset);
 
-  // ── conversation area ──────────────────────────────────────────────────────
-  const inputRows  = 2;                        // separator + input line
-  const acRows     = acList.visible ? acList.items.length : 0;
-  const convHeight = height - 1 - inputRows - acRows;
-
+  // ── conversation ──────────────────────────────────────────────
   const convLines = [];
-  for (const msg of history) convLines.push(...renderMessage(msg, width));
+  for (const msg of history) convLines.push(...renderMessage(msg, W));
   if (processing) {
-    if (streamLine) {
-      convLines.push(...renderStreamingLine(streamLine, width));
-    } else {
-      convLines.push(...loader.render(width));
-    }
+    convLines.push(
+      ...(streamLine ? renderStreamingLine(streamLine, W) : loader.render(W)),
+    );
   }
 
-  // Show last convHeight lines (simple scroll — always follows latest output)
-  const visible = convLines.slice(-convHeight);
-  while (visible.length < convHeight) visible.unshift("");
-  lines.push(...visible);
+  if (convHeight > 0) {
+    const clip = convLines.length > convHeight
+      ? convLines.slice(-convHeight)
+      : convLines;
+    lines.push(...clip);
+    for (let i = clip.length; i < convHeight; i++) lines.push("");
+  }
 
-  // ── autocomplete overlay ───────────────────────────────────────────────────
-  if (acRows > 0) lines.push(...acList.render(width));
+  // ── autocomplete overlay ─────────────────────────────────────
+  if (acRows > 0) {
+    const acRendered = acList.render(W);
+    for (let i = 0; i < acRows; i++) lines.push(acRendered[i] ?? "");
+  }
 
-  // ── separator + input ──────────────────────────────────────────────────────
-  lines.push(ansi.color.gray + "─".repeat(width) + ansi.style.reset);
+  // ── bottom: blank + separator + input + status bar ───────────────
+  lines.push("");
+  lines.push(ansi.color.gray + "─".repeat(W) + ansi.style.reset);
   if (processing) {
-    lines.push(ansi.style.dim + "  Processing…" + ansi.style.reset);
+    lines.push("  " + ansi.style.dim + "Processing…" + ansi.style.reset);
   } else {
-    lines.push(...input.render(width));
+    lines.push(input.render(W)[0] ?? "");
   }
+  lines.push(ansi.color.gray + "─".repeat(W) + ansi.style.reset); // sep below input
+  lines.push(renderStatusBar(W));
+  lines.push("");  // empty row so status bar is not glued to terminal edge
 
-  return lines;
+  while (lines.length < height) lines.push("");
+  return lines.slice(0, height);
 }
+
+function renderStatusBar(width) {
+  const parts = [
+    CONFIG.model,
+    CONFIG.dtype,
+    CONFIG.device,
+    `${CONFIG.threads}t`,
+    `thinking:${agent.enableThinking ? "on" : "off"}`,
+  ];
+  const text = parts.join("  ·  ");
+  const bar  = strip(text).length <= width - 2
+    ? text
+    : strip(text).slice(0, width - 3) + "…";
+  return ansi.style.dim + " " + bar + ansi.style.reset;
+}
+
+
 
 function renderMessage({ role, content, meta }, width) {
   const out = [];
@@ -147,12 +192,19 @@ function renderMessage({ role, content, meta }, width) {
 }
 
 function renderStreamingLine(text, width) {
-  const mdLines = new Markdown(text).render(width - 2);
-  const pfx = ansi.color.brightBlue + ansi.style.bold + "Agent" + ansi.style.reset + "  ";
-  const out = [pfx + (mdLines[0] ?? "")];
-  for (let i = 1; i < mdLines.length; i++) out.push("       " + mdLines[i]);
-  return out;
+  const plain = strip(text.replace(/<think>[\s\S]*?<\/think>\s*/g, "").trim());
+  const inner  = width - 7; // "Agent  " prefix = 7 chars
+  const pfx    = ansi.color.brightBlue + ansi.style.bold + "Agent" + ansi.style.reset + "  ";
+  const wrapped = plain.length === 0 ? [""] : [];
+  let remaining = plain;
+  while (remaining.length > 0) {
+    wrapped.push(remaining.slice(0, inner));
+    remaining = remaining.slice(inner);
+  }
+  return wrapped.map((l, i) => (i === 0 ? pfx + l : "       " + l));
 }
+
+
 
 function wrapWithPrefix(text, width, firstPrefix, restPrefix) {
   const lines = [];
@@ -185,22 +237,28 @@ function render(hints = {}) {
 
 const agent = new Agent({
   ...CONFIG,
-  stream: true,
-  tools:  [new ReadTool(), new WriteTool(), new EditTool(), new BashTool()],
+  verbose: false,   // TUI owns all output; agent verbose logs write to stdout
+                    // and corrupt the terminal rendering.
+  stream:  true,
+  tools:   [new ReadTool(), new WriteTool(), new EditTool(), new BashTool()],
   onToken(token) {
     streamLine += token;
     render();
   },
   onStep({ reply }) {
-    // Show tool calls as they happen
+    // Record tool calls so they appear in the conversation while processing
     if (reply.tool_calls?.length) {
       for (const call of reply.tool_calls) {
-        const args = (() => { try { return JSON.parse(call.function.arguments); } catch { return {}; } })();
+        const args = (() => {
+          try { return JSON.parse(call.function.arguments); } catch { return {}; }
+        })();
         history.push({ role: "tool_call", content: "", meta: { name: call.function.name, args } });
       }
     }
   },
 });
+
+
 
 async function runQuery(query) {
   if (!query.trim()) return;

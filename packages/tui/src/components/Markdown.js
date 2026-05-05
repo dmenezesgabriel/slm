@@ -93,6 +93,18 @@ export class Markdown extends Component {
         result.push(this._inline(l));
     }
 
+    // If the source ends with an unclosed fence (e.g. during streaming),
+    // close the box so the render is always visually complete.
+    if (inCode) {
+      const inner = Math.max(1, width - 4);
+      result.push(color.gray + "┌" + "─".repeat(width - 2) + "┐" + style.reset);
+      for (const cl of codeLines) {
+        const text = cl.slice(0, inner).padEnd(inner);
+        result.push(color.gray + "│ " + style.reset + color.fg(220) + text + style.reset + color.gray + " │" + style.reset);
+      }
+      result.push(color.gray + "└" + "─".repeat(width - 2) + "┘" + style.reset);
+    }
+
     return result;
   }
 

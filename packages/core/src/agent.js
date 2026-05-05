@@ -87,7 +87,7 @@ export class Agent {
    * @param {string}   [opts.model]           HF model id
    * @param {string}   [opts.dtype]           "q4" | "q4f16" | "fp32"
    * @param {string}   [opts.device]          "cpu" | "webgpu"
-   * @param {string}   [opts.cacheDir]        local cache dir (Node)
+   * @param {string}   [opts.cacheDir]        cache dir — defaults to ~/.transformers-js/.cache
    * @param {number}   [opts.threads]         ONNX CPU thread count (default: 2)
    * @param {string}   [opts.systemPrompt]    override default system prompt
    * @param {number}   [opts.maxSteps]        max tool-call iterations (default 6)
@@ -109,7 +109,7 @@ export class Agent {
     this.model          = opts.model          ?? "onnx-community/Qwen3-0.6B-ONNX";
     this.dtype          = opts.dtype          ?? "q4";
     this.device         = opts.device         ?? "cpu";
-    this.cacheDir       = opts.cacheDir       ?? "./.cache";
+    this.cacheDir       = opts.cacheDir;      // undefined → model.js falls back to ~/.transformers-js/.cache
     this.threads        = opts.threads        ?? 2;
     this.maxSteps       = opts.maxSteps       ?? 6;
     this.maxNewTokens   = opts.maxNewTokens   ?? 512;

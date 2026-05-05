@@ -111,7 +111,8 @@ export class Input extends Component {
   }
 
   render(width) {
-    const available = width - strip(this.prefix).length;
+    const prefixLen = strip(this.prefix).length;
+    const available = Math.max(1, width - prefixLen);
 
     if (!this.value && this.placeholder) {
       const ph = strip(this.placeholder).slice(0, available);
