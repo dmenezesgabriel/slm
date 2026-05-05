@@ -68,16 +68,19 @@ STREAM=true node src/index.js "What is 144 squared?"
 
 ### Environment variables
 
-| Variable        | Default                          | Description                     |
-|-----------------|----------------------------------|---------------------------------|
-| `MODEL`         | `onnx-community/Qwen3-0.6B-ONNX` | HF model id                     |
-| `DTYPE`         | `q4`                             | `q4` / `q4f16` / `fp32`        |
-| `DEVICE`        | `wasm`                           | `wasm` (CPU) or `webgpu` (GPU) |
-| `CACHE_DIR`     | `./.cache`                       | Local model cache directory     |
-| `MAX_STEPS`     | `8`                              | Max agent iterations            |
-| `MAX_NEW_TOKENS`| `512`                            | Tokens per model call           |
-| `VERBOSE`       | `true`                           | Show step-by-step logs          |
-| `STREAM`        | `false`                          | Stream tokens to stdout         |
+| Variable          | Default                          | Description                     |
+|-------------------|----------------------------------|---------------------------------|
+| `MODEL`           | `onnx-community/Qwen3-0.6B-ONNX` | HF model id                     |
+| `DTYPE`           | `q4`                             | `q4` / `q4f16` / `fp32`        |
+| `DEVICE`          | `cpu`                            | `cpu` (ONNX/wasm) or `webgpu`  |
+| `CACHE_DIR`       | `./.cache`                       | Local model cache directory     |
+| `MAX_STEPS`       | `8`                              | Max agent iterations            |
+| `MAX_NEW_TOKENS`  | `512`                            | Answer-phase token budget       |
+| `VERBOSE`         | `true`                           | Show step-by-step logs          |
+| `STREAM`          | `false`                          | Stream tokens to stdout         |
+| `THREADS`         | `2`                              | ONNX CPU thread count. Keep low on RAM-constrained machines. |
+| `ENABLE_THINKING` | `false`                          | Qwen3 chain-of-thought. When `false` (default) the template pre-fills an empty `<think></think>` block so the model skips reasoning and dedicates all tokens to the answer. Set `true` to keep full reasoning — `THINKING_BUDGET` tokens are added automatically so the answer is never truncated by the thinking phase. |
+| `THINKING_BUDGET` | `512`                            | Extra tokens reserved for `<think>…</think>` when `ENABLE_THINKING=true`. Raise to `1024`+ for hard multi-step problems. |
 
 ---
 

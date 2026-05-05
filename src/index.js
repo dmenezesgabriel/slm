@@ -17,6 +17,11 @@
  *   VERBOSE          true | false         (default: true)
  *   STREAM           stream tokens        (default: false)
  *   THREADS          ONNX CPU threads     (default: 2)  — raise on machines with >8 GB RAM
+ *   ENABLE_THINKING  true | false         (default: false) — Qwen3 chain-of-thought;
+ *                    when true the full thinking block is available and the answer
+ *                    token budget is extended automatically by THINKING_BUDGET
+ *   THINKING_BUDGET  extra tokens for <think> phase  (default: 512) — only used
+ *                    when ENABLE_THINKING=true; raise to 1024+ for hard problems
  */
 
 import { Agent } from "./core/agent.js";
@@ -30,15 +35,22 @@ import {
 // ── config ─────────────────────────────────────────────────────────────────────
 
 const CONFIG = {
-  model:        process.env.MODEL         ?? "onnx-community/Qwen3-0.6B-ONNX",
-  dtype:        process.env.DTYPE         ?? "q4",
-  device:       process.env.DEVICE        ?? "cpu",
-  cacheDir:     process.env.CACHE_DIR     ?? "./.cache",
-  maxSteps:     Number(process.env.MAX_STEPS      ?? 8),
-  maxNewTokens: Number(process.env.MAX_NEW_TOKENS ?? 512),
-  verbose:      process.env.VERBOSE       !== "false",
-  stream:       process.env.STREAM        === "true",
-  threads:      Number(process.env.THREADS       ?? 2),
+  model:           process.env.MODEL            ?? "onnx-community/Qwen3-0.6B-ONNX",
+  dtype:           process.env.DTYPE            ?? "q4",
+  device:          process.env.DEVICE           ?? "cpu",
+  cacheDir:        process.env.CACHE_DIR        ?? "./.cache",
+  maxSteps:        Number(process.env.MAX_STEPS        ?? 8),
+  maxNewTokens:    Number(process.env.MAX_NEW_TOKENS   ?? 512),
+  verbose:         process.env.VERBOSE          !== "false",
+  stream:          process.env.STREAM           === "true",
+  threads:         Number(process.env.THREADS          ?? 2),
+  // Qwen3 thinking mode.
+  // When false (default) the Qwen3 template pre-fills <think>\n\n</think>\n\n,
+  // steering the model to skip chain-of-thought and answer directly.
+  // When true, thinkingBudget extra tokens are added to max_new_tokens so
+  // the answer phase is never starved by the reasoning block.
+  enableThinking:  process.env.ENABLE_THINKING  === "true",
+  thinkingBudget:  Number(process.env.THINKING_BUDGET  ?? 512),
 };
 
 // ── demo queries ───────────────────────────────────────────────────────────────
@@ -54,6 +66,18 @@ const DEMO_QUERIES = [
 // ── main ───────────────────────────────────────────────────────────────────────
 
 async function main() {
+  // Bug 6 fix: catch any exception / rejection that escapes the main promise
+  // chain (e.g. a synchronous throw inside a non-awaited callback).  Without
+  // these handlers Node.js prints nothing useful and exits with code 1.
+  process.on("uncaughtException", (err) => {
+    console.error("\n[uncaughtException]", err.stack ?? err.message);
+    process.exit(1);
+  });
+  process.on("unhandledRejection", (reason) => {
+    console.error("\n[unhandledRejection]", reason instanceof Error ? reason.stack : reason);
+    process.exit(1);
+  });
+
   const agent = new Agent({
     ...CONFIG,
     tools: [

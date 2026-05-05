@@ -111,11 +111,11 @@ export async function loadModel({
 
   if (cacheDir && env.cacheDir !== undefined) env.cacheDir = cacheDir;
 
-  // Cap ONNX CPU threads.
-  // Default is "all logical cores" which on Crostini competes with ChromeOS
-  // for the same RAM and can trigger the OOM killer / kernel freeze.
-  // 2 threads keeps RSS predictable while staying responsive.
-  if (device === "cpu" && env.backends?.onnx?.wasm) {
+  // Bug 5 fix: transformers.js maps both "cpu" and "wasm" to the ONNX WebAssembly
+  // backend.  The README documents "wasm" as the default, so if the user passes
+  // DEVICE=wasm the thread count was never capped — all logical cores competed
+  // for RAM and could trigger the OOM killer on constrained machines.
+  if ((device === "cpu" || device === "wasm") && env.backends?.onnx?.wasm) {
     env.backends.onnx.wasm.numThreads = threads;
   }
 
