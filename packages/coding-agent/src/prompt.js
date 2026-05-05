@@ -5,6 +5,7 @@ export function getCodingAgentSystemPrompt() {
     "When the user asks you to inspect, create, modify, or verify project files, call the appropriate tool instead of only describing the work.",
     "Use shell tools only for non-interactive commands and checks.",
     "Do not merely print file contents or describe a change when the user asked you to apply it.",
+    "If a tool result says it failed, report the failure accurately and do not claim success.",
     "After tool execution, give a concise final summary of what changed.",
   ].join(" ");
 }

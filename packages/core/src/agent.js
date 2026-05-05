@@ -48,8 +48,10 @@
  * exist and is always undefined, which silently disables streaming).
  */
 
-import { TextStreamer } from "@huggingface/transformers";
+import { InterruptableStoppingCriteria, TextStreamer } from "@huggingface/transformers";
 import { loadModel } from "./model.js";
+import { ToolRuntime } from "./tool-runtime.js";
+import { FinalAnswerTool } from "./tools/final-answer.js";
 
 // ── helpers ────────────────────────────────────────────────────────────────────
 
@@ -60,22 +62,8 @@ function log(label, text, verbose) {
   console.log(`\n${DIVIDER}\n[${label}]\n${text}`);
 }
 
-/**
- * Cap tool result length before appending to messages.
- * Uncapped results from e.g. Wikipedia can be several KB each;
- * multiplied by maxSteps they push context into swap territory on 8 GB machines.
- */
-function truncate(str, maxChars = 1200) {
-  if (str.length <= maxChars) return str;
-  return str.slice(0, maxChars) + `… [truncated ${str.length - maxChars} chars]`;
-}
-
-function toolResultMessage(toolCallId, result) {
-  return {
-    role:         "tool",
-    tool_call_id: toolCallId,
-    content:      truncate(result),
-  };
+function throwIfAborted(signal) {
+  if (signal?.aborted) throw signal.reason ?? new Error("Aborted");
 }
 
 // ── Agent ──────────────────────────────────────────────────────────────────────
@@ -122,9 +110,8 @@ export class Agent {
     this.onProgress     = opts.onProgress     ?? null;
     this.systemPrompt   = opts.systemPrompt   ?? this._defaultSystemPrompt();
 
-    this.tools    = opts.tools ?? [];
-    this._toolMap = Object.fromEntries(this.tools.map((t) => [t.name, t]));
-    this._pipe    = null;
+    this.tools = opts.tools ?? [];
+    this._pipe = null;
   }
 
   // ── public API ───────────────────────────────────────────────────────────────
@@ -168,13 +155,23 @@ export class Agent {
    * @returns {Promise<string>} final answer
    */
   async runMessages(messages, callbacks = {}) {
+    throwIfAborted(callbacks.signal);
     await this.load();
+    throwIfAborted(callbacks.signal);
 
-    const toolSchemas = this.tools.map((t) => t.toOpenAISchema());
+    const runtimeTools = this._runtimeTools();
+    const toolSchemas = runtimeTools.map((t) => t.toOpenAISchema());
+    const toolRuntime = new ToolRuntime({
+      tools: runtimeTools,
+      onToolCall: callbacks.onToolCall,
+      onToolResult: callbacks.onToolResult,
+    });
     const onStep = callbacks.onStep ?? this.onStep;
 
     for (let step = 0; step < this.maxSteps; step++) {
+      throwIfAborted(callbacks.signal);
       const reply = await this._generate(messages, toolSchemas, callbacks);
+      throwIfAborted(callbacks.signal);
 
       // Guard against an undefined/null reply (e.g. empty generated_text
       // from an unexpected pipeline response shape).
@@ -183,11 +180,11 @@ export class Agent {
         return "Model returned an empty response. Try again.";
       }
 
-      messages.push(reply);
-      onStep?.({ step, reply, messages: [...messages] });
-
-      // text-only response → done
+      // text-only response → done. final_answer is the preferred terminal
+      // path for tool-capable models; this fallback keeps plain chat usable.
       if (!reply.tool_calls?.length) {
+        messages.push(reply);
+        onStep?.({ step, reply, messages: [...messages] });
         const answer = typeof reply.content === "string"
           ? reply.content
           : JSON.stringify(reply.content);
@@ -198,36 +195,19 @@ export class Agent {
       log(`Step ${step + 1} — Tool Calls`,
           JSON.stringify(reply.tool_calls, null, 2), this.verbose);
 
-      for (const call of reply.tool_calls) {
-        const { name, arguments: rawArgs } = call.function;
+      const toolResult = await toolRuntime.execute(reply.tool_calls);
 
-        // JSON.parse can throw when the model hits max_new_tokens mid-generation
-        // and the JSON string is truncated.  Treat a parse failure as a tool
-        // error so the loop can recover gracefully.
-        let args;
-        try {
-          args = typeof rawArgs === "string" ? JSON.parse(rawArgs) : rawArgs;
-        } catch (parseErr) {
-          const msg = `Bad tool-call JSON for "${name}": ${parseErr.message}`;
-          log("Tool Parse Error", msg, this.verbose);
-          messages.push(toolResultMessage(call.id ?? name, msg));
-          continue;
-        }
-
-        const tool = this._toolMap[name];
-        if (!tool) {
-          const err = `Unknown tool: "${name}". Available: ${Object.keys(this._toolMap).join(", ")}`;
-          log("Tool Error", err, this.verbose);
-          messages.push(toolResultMessage(call.id ?? name, err));
-          continue;
-        }
-
-        log(`Tool: ${name}`, JSON.stringify(args), this.verbose);
-        const result = await tool.run(args);
-        log("Observation", result, this.verbose);
-
-        messages.push(toolResultMessage(call.id ?? name, result));
+      if (toolResult.finalAnswer !== null) {
+        messages.push(...toolResult.messages);
+        const finalReply = { role: "assistant", content: toolResult.finalAnswer };
+        messages.push(finalReply);
+        onStep?.({ step, reply: finalReply, messages: [...messages] });
+        log("Final Answer", toolResult.finalAnswer, this.verbose);
+        return toolResult.finalAnswer;
       }
+
+      messages.push(reply, ...toolResult.messages);
+      onStep?.({ step, reply, messages: [...messages] });
     }
 
     return "Reached maximum steps without a final answer. Try a simpler question.";
@@ -272,6 +252,17 @@ export class Agent {
         : undefined,
     };
 
+    const signal = callbacks.signal;
+    let abortCriteria = null;
+    let abortListener = null;
+    if (signal) {
+      throwIfAborted(signal);
+      abortCriteria = new InterruptableStoppingCriteria();
+      abortListener = () => abortCriteria.interrupt();
+      signal.addEventListener("abort", abortListener, { once: true });
+      genOpts.stopping_criteria = abortCriteria;
+    }
+
     // ── streaming ────────────────────────────────────────────────────────────
     //
     // TextStreamer MUST be imported at the top of this file and instantiated
@@ -304,12 +295,19 @@ export class Agent {
       genOpts.streamer = streamer;
     }
 
-    const output    = await this._pipe(messages, genOpts);
-    const generated = output[0].generated_text;
-    const raw       = generated[generated.length - 1];
+    try {
+      const output    = await this._pipe(messages, genOpts);
+      throwIfAborted(signal);
+      const generated = output[0].generated_text;
+      const raw       = generated[generated.length - 1];
 
-    // Normalise the raw pipeline reply into a properly-structured chat message.
-    return this._parseReply(raw);
+      // Normalise the raw pipeline reply into a properly-structured chat message.
+      return this._parseReply(raw);
+    } finally {
+      if (signal && abortListener) {
+        signal.removeEventListener("abort", abortListener);
+      }
+    }
   }
 
   /**
@@ -397,6 +395,12 @@ export class Agent {
       content:    contentWithoutCalls,   // may include <think>…</think> for history
       tool_calls,
     };
+  }
+
+  _runtimeTools() {
+    return this.tools.some((tool) => tool.name === "final_answer")
+      ? this.tools
+      : [...this.tools, new FinalAnswerTool()];
   }
 
   _defaultSystemPrompt() {

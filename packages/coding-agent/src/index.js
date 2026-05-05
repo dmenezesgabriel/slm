@@ -20,15 +20,18 @@
 import { Agent, AgentSession } from "@slms/core";
 import {
   Screen, Renderer,
-  Input, Loader, Markdown,
+  Input, Loader, Markdown, SelectList,
   ansi, strip,
   Autocomplete, SlashCommands,
   getFileCompletions, triggerFileCompletion,
 } from "@slms/tui";
 import { ReadTool, WriteTool, EditTool, BashTool } from "./tools/index.js";
 import { getCodingAgentSystemPrompt } from "./prompt.js";
+import { JsonlSessionStore } from "./session-store.js";
 
 // ── config ────────────────────────────────────────────────────────────────────
+
+const WORKING_DIR = process.env.INIT_CWD ?? process.cwd();
 
 const CONFIG = {
   model:          process.env.MODEL            ?? "onnx-community/Qwen3-0.6B-ONNX",
@@ -46,6 +49,8 @@ const CONFIG = {
 const slashCmds = new SlashCommands([
   { name: "help",    description: "Show available commands" },
   { name: "clear",   description: "Clear the conversation" },
+  { name: "new",     description: "Start a new persisted session" },
+  { name: "session", description: "Show current session info" },
   { name: "reset",   description: "Clear conversation and reset model state" },
   { name: "thinking",description: "Toggle thinking mode" },
   { name: "exit",    description: "Exit the agent" },
@@ -56,6 +61,8 @@ const slashCmds = new SlashCommands([
 const history   = [];   // { role, content, meta? } — display history
 let   processing = false;
 let   streamLine = "";  // token buffer for current streamed response
+let   resumeSelector = null;
+let   session = null;
 
 // ── TUI setup ─────────────────────────────────────────────────────────────────
 
@@ -101,6 +108,25 @@ function buildFrame(width, height) {
   // ── conversation ──────────────────────────────────────────────
   const convLines = [];
   for (const msg of history) convLines.push(...renderMessage(msg, W));
+  if (resumeSelector) {
+    convLines.push(...resumeSelector.render(W));
+    convLines.push(ansi.style.dim + "  Enter: resume  Esc: cancel" + ansi.style.reset);
+    convLines.push("");
+  }
+
+  if (session) {
+    const queued = session.queuedMessages;
+    if (queued.steer.length || queued.followUp.length) {
+      for (const text of queued.steer) {
+        convLines.push(ansi.color.yellow + "  queued steer  " + ansi.style.reset + ansi.style.dim + text + ansi.style.reset);
+      }
+      for (const text of queued.followUp) {
+        convLines.push(ansi.color.yellow + "  queued follow-up  " + ansi.style.reset + ansi.style.dim + text + ansi.style.reset);
+      }
+      convLines.push("");
+    }
+  }
+
   if (processing) {
     convLines.push(
       ...(streamLine ? renderStreamingLine(streamLine, W) : loader.render(W)),
@@ -124,11 +150,7 @@ function buildFrame(width, height) {
   // ── bottom: blank + separator + input + status bar ───────────────
   lines.push("");
   lines.push(ansi.color.gray + "─".repeat(W) + ansi.style.reset);
-  if (processing) {
-    lines.push("  " + ansi.style.dim + "Processing…" + ansi.style.reset);
-  } else {
-    lines.push(input.render(W)[0] ?? "");
-  }
+  lines.push(input.render(W)[0] ?? "");
   lines.push(ansi.color.gray + "─".repeat(W) + ansi.style.reset); // sep below input
   lines.push(renderStatusBar(W));
   lines.push("");  // empty row so status bar is not glued to terminal edge
@@ -242,34 +264,37 @@ const agent = new Agent({
                     // and corrupt the terminal rendering.
   stream:  true,
   systemPrompt: getCodingAgentSystemPrompt(),
-  tools:   [new ReadTool(), new WriteTool(), new EditTool(), new BashTool()],
+  tools:   [
+    new ReadTool({ cwd: WORKING_DIR }),
+    new WriteTool({ cwd: WORKING_DIR }),
+    new EditTool({ cwd: WORKING_DIR }),
+    new BashTool({ cwd: WORKING_DIR }),
+  ],
 });
 
-const session = new AgentSession({ agent });
-
+const sessionStore = new JsonlSessionStore({ cwd: WORKING_DIR });
 const pendingToolCalls = new Map();
+let unsubscribeSession = null;
 
-session.subscribe((event) => {
+function bindSession(restoredMessages = []) {
+  unsubscribeSession?.();
+  const messages = [
+    { role: "system", content: agent.systemPrompt },
+    ...restoredMessages,
+  ];
+  session = new AgentSession({ agent, store: sessionStore, messages });
+  unsubscribeSession = session.subscribe(handleSessionEvent);
+}
+
+function handleSessionEvent(event) {
   if (event.type === "message") {
     if (event.message.role === "user") {
       history.push({ role: "user", content: event.message.content });
     } else if (event.message.role === "assistant") {
       streamLine = "";
-      if (event.message.tool_calls?.length) {
-        for (const call of event.message.tool_calls) {
-          const args = (() => {
-            try { return JSON.parse(call.function.arguments); } catch { return {}; }
-          })();
-          pendingToolCalls.set(call.id, call.function.name);
-          history.push({ role: "tool_call", content: "", meta: { name: call.function.name, args } });
-        }
-      } else {
+      if (!event.message.tool_calls?.length) {
         history.push({ role: "assistant", content: event.message.content });
       }
-    } else if (event.message.role === "tool") {
-      const name = pendingToolCalls.get(event.message.tool_call_id) ?? "tool";
-      pendingToolCalls.delete(event.message.tool_call_id);
-      history.push({ role: "tool_result", content: event.message.content, meta: { name } });
     }
     render();
     return;
@@ -281,14 +306,69 @@ session.subscribe((event) => {
     return;
   }
 
+  if (event.type === "tool_call") {
+    pendingToolCalls.set(event.id, event.name);
+    if (event.name !== "final_answer") {
+      history.push({ role: "tool_call", content: "", meta: { name: event.name, args: event.args } });
+      render();
+    }
+    return;
+  }
+
+  if (event.type === "tool_result") {
+    const name = pendingToolCalls.get(event.id) ?? event.name ?? "tool";
+    pendingToolCalls.delete(event.id);
+    if (name !== "final_answer") {
+      history.push({ role: "tool_result", content: event.result, meta: { name } });
+      render();
+    }
+    return;
+  }
+
+  if (event.type === "queued_message" || event.type === "queue_update") {
+    render();
+    return;
+  }
+
+  if (event.type === "aborted") {
+    streamLine = "";
+    history.push({ role: "info", content: "Aborted current agent run. Queued messages are preserved." });
+    render();
+    return;
+  }
+
   if (event.type === "error") {
     streamLine = "";
-    history.push({ role: "error", content: event.error.message });
+    if (event.error.name !== "AbortError") {
+      history.push({ role: "error", content: event.error.message });
+    }
     render();
   }
-});
+}
+
+bindSession();
 
 
+
+function resumeSession(sessionFile) {
+  const restoredMessages = sessionStore.resume(sessionFile);
+  pendingToolCalls.clear();
+  history.length = 0;
+  bindSession(restoredMessages);
+
+  for (const message of session.visibleMessages) {
+    if (message.role === "user") {
+      history.push({ role: "user", content: message.content });
+    } else if (message.role === "assistant" && !message.tool_calls?.length) {
+      history.push({ role: "assistant", content: message.content });
+    } else if (message.role === "tool") {
+      history.push({ role: "tool_result", content: message.content, meta: { name: "tool" } });
+    }
+  }
+
+  history.push({ role: "info", content: `Resumed session: ${sessionStore.getInfo().sessionId}` });
+  renderer.forceFullRender();
+}
 
 async function runQuery(query) {
   if (!query.trim()) return;
@@ -315,13 +395,48 @@ function handleSlash(cmd) {
   const [name, ...rest] = cmd.trim().slice(1).split(/\s+/);
   switch (name) {
     case "help":
-      history.push({ role: "info", content: "Commands: /help  /clear  /reset  /thinking  /exit" });
+      history.push({ role: "info", content: "Commands: /help  /clear  /new  /resume  /session  /reset  /thinking  /exit" });
       break;
     case "clear":
       history.length = 0;
       session.reset();
       renderer.forceFullRender();
       break;
+    case "new":
+      sessionStore.newSession();
+      pendingToolCalls.clear();
+      history.length = 0;
+      bindSession();
+      history.push({ role: "info", content: `New session: ${sessionStore.getInfo().sessionId}` });
+      renderer.forceFullRender();
+      break;
+    case "resume": {
+      const sessions = JsonlSessionStore
+        .listSessions({ cwd: WORKING_DIR })
+        .filter((s) => s.sessionFile !== sessionStore.getInfo().sessionFile);
+      if (sessions.length === 0) {
+        history.push({ role: "info", content: "No saved sessions found." });
+        break;
+      }
+      resumeSelector = new SelectList(sessions.map((s) => ({
+        label: `${s.sessionId.slice(0, 8)}  ${s.entryCount} entries  ${s.sessionFile}`,
+        value: s.sessionFile,
+      })), { maxRows: 8 });
+      resumeSelector.on("select", (item) => {
+        resumeSelector = null;
+        resumeSession(item.value);
+        render();
+      });
+      break;
+    }
+    case "session": {
+      const info = sessionStore.getInfo();
+      history.push({
+        role: "info",
+        content: `Session: ${info.sessionId}\nFile: ${info.sessionFile}\nMessages/events: ${info.entryCount}`,
+      });
+      break;
+    }
     case "reset":
       history.length = 0;
       session.reset();
@@ -360,10 +475,21 @@ screen.on("paste", ({ text, lines, large }) => {
 // ── key handler ──────────────────────────────────────────────────────────────
 
 screen.on("key", (key) => {
-  if (processing) {
-    // Only allow Ctrl-C during processing
-    if (key.name === "ctrl-c") { screen.stop(); process.exit(0); }
+  if (processing && (key.name === "ctrl-c" || key.name === "escape")) {
+    session.abort();
     return;
+  }
+
+  if (resumeSelector) {
+    if (key.name === "escape" || key.name === "ctrl-c") {
+      resumeSelector = null;
+      render();
+      return;
+    }
+    if (resumeSelector.handleKey(key)) {
+      render();
+      return;
+    }
   }
 
   // Autocomplete takes priority
@@ -403,12 +529,17 @@ screen.on("key", (key) => {
       acList.show(fp ? getFileCompletions(fp.partial) : []);
     }
 
-    if (key.name === "return" && !processing) {
+    if (key.name === "return") {
       const val = input.value.trim();
       acList.hide();
       input.clear();
-      if (val.startsWith("/")) handleSlash(val);
-      else runQuery(val);
+      if (processing) {
+        if (val) session.steer(val);
+      } else if (val.startsWith("/")) {
+        handleSlash(val);
+      } else {
+        runQuery(val);
+      }
     } else {
       // Inline strategy for single-line edits (no full redraw needed)
       render({ inlineRow: screen.height - 1 });
@@ -435,7 +566,7 @@ async function main() {
   // Show startup info
   history.push({
     role: "info",
-    content: `Model: ${CONFIG.model}  dtype: ${CONFIG.dtype}  device: ${CONFIG.device}`,
+    content: `Model: ${CONFIG.model}  dtype: ${CONFIG.dtype}  device: ${CONFIG.device}\nCwd: ${WORKING_DIR}\nSession: ${sessionStore.getInfo().sessionId}`,
   });
 
   const oneShot = process.argv[2];

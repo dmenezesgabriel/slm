@@ -10,6 +10,8 @@ describe("coding agent system prompt", () => {
     expect(prompt).toMatch(/inspect, create, modify, or verify project files/i);
     expect(prompt).toMatch(/call the appropriate tool/i);
     expect(prompt).toMatch(/Do not merely print/i);
+    expect(prompt).toMatch(/If a tool result says it failed/i);
+    expect(prompt).toMatch(/do not claim success/i);
     expect(prompt).not.toMatch(/call the write tool/i);
   });
 });

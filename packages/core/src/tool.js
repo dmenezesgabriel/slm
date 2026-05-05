@@ -8,7 +8,7 @@
  *   - declares its input shape with a Zod schema
  *   - exposes a toOpenAISchema() that produces the JSON-Schema block
  *     the transformers.js pipeline `tools` array expects
- *   - implements execute(validatedInput) → Promise<string>
+ *   - implements execute(validatedInput) → Promise<string | ToolResult>
  *
  * Usage:
  *   class MyTool extends Tool {
@@ -24,6 +24,20 @@
 
 import { z } from "zod";
 import { zodToJsonSchema } from "zod-to-json-schema";
+
+function normalizeToolResult(value) {
+  if (value && typeof value === "object" && "content" in value) {
+    return {
+      content: String(value.content),
+      isError: Boolean(value.isError),
+    };
+  }
+
+  return {
+    content: String(value),
+    isError: false,
+  };
+}
 
 export class Tool {
   /** @type {string} — tool name as the model will call it */
@@ -75,21 +89,38 @@ export class Tool {
    * @returns {Promise<string>}
    */
   async run(rawArgs) {
+    const result = await this.runWithResult(rawArgs);
+    return result.content;
+  }
+
+  /**
+   * Run the tool and return structured result metadata for agent runtimes.
+   * @param {unknown} rawArgs — parsed JSON from the model's tool_call
+   * @returns {Promise<{ content: string, isError: boolean }>}
+   */
+  async runWithResult(rawArgs) {
     const parsed = this.schema.safeParse(rawArgs);
     if (!parsed.success) {
-      return `Tool input validation error: ${parsed.error.message}`;
+      return {
+        content: `Tool input validation error: ${parsed.error.message}`,
+        isError: true,
+      };
     }
+
     try {
-      return String(await this.execute(parsed.data));
+      return normalizeToolResult(await this.execute(parsed.data));
     } catch (err) {
-      return `Tool execution error: ${err.message}`;
+      return {
+        content: `Tool execution error: ${err.message}`,
+        isError: true,
+      };
     }
   }
 
   /**
    * Override this in subclasses.
    * @param {object} _input — validated and typed input
-   * @returns {Promise<string>}
+   * @returns {Promise<string | { content: string, isError?: boolean }>}
    */
   async execute(_input) {
     throw new Error(`Tool "${this.name}" has no execute() implementation.`);

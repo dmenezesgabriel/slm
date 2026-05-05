@@ -23,8 +23,9 @@ describe("Agent tool schema injection", () => {
       { role: "user", content: "echo hello" },
     ]);
 
-    expect(generateOptions.tokenizer_encode_kwargs.tools).toHaveLength(1);
-    expect(generateOptions.tokenizer_encode_kwargs.tools[0]).toMatchObject({
+    const toolSchemas = generateOptions.tokenizer_encode_kwargs.tools;
+    expect(toolSchemas.map((schema) => schema.function.name)).toEqual(["echo", "final_answer"]);
+    expect(toolSchemas[0]).toMatchObject({
       type: "function",
       function: {
         name: "echo",
