@@ -16,6 +16,7 @@
  *   MAX_NEW_TOKENS   tokens per call      (default: 512)
  *   VERBOSE          true | false         (default: true)
  *   STREAM           stream tokens        (default: false)
+ *   THREADS          ONNX CPU threads     (default: 2)  — raise on machines with >8 GB RAM
  */
 
 import { Agent } from "./core/agent.js";
@@ -37,6 +38,7 @@ const CONFIG = {
   maxNewTokens: Number(process.env.MAX_NEW_TOKENS ?? 512),
   verbose:      process.env.VERBOSE       !== "false",
   stream:       process.env.STREAM        === "true",
+  threads:      Number(process.env.THREADS       ?? 2),
 };
 
 // ── demo queries ───────────────────────────────────────────────────────────────

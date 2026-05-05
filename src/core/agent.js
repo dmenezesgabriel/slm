@@ -3,10 +3,6 @@
  *
  * Agent base class + agentic loop built purely on transformers.js v4.
  * No framework deps — only @huggingface/transformers + your tools.
- *
- * Streaming: opt-in via opts.stream = true.
- * TextStreamer is imported directly from the library (top-level import),
- * not smuggled through the pipeline object.
  */
 
 import { TextStreamer } from "@huggingface/transformers";
@@ -21,11 +17,21 @@ function log(label, text, verbose) {
   console.log(`\n${DIVIDER}\n[${label}]\n${text}`);
 }
 
+/**
+ * Cap tool result length before appending to messages.
+ * Uncapped results from e.g. Wikipedia can be several KB each;
+ * multiplied by maxSteps they push context into swap territory on 8 GB machines.
+ */
+function truncate(str, maxChars = 1200) {
+  if (str.length <= maxChars) return str;
+  return str.slice(0, maxChars) + `… [truncated ${str.length - maxChars} chars]`;
+}
+
 function toolResultMessage(toolCallId, result) {
   return {
     role:         "tool",
     tool_call_id: toolCallId,
-    content:      result,
+    content:      truncate(result),
   };
 }
 
@@ -39,8 +45,9 @@ export class Agent {
    * @param {string}   [opts.dtype]         "q4" | "q4f16" | "fp32"
    * @param {string}   [opts.device]        "cpu" | "webgpu"
    * @param {string}   [opts.cacheDir]      local cache dir (Node)
+   * @param {number}   [opts.threads]       ONNX CPU thread count (default: 2)
    * @param {string}   [opts.systemPrompt]  override default system prompt
-   * @param {number}   [opts.maxSteps]      max tool-call iterations (default 8)
+   * @param {number}   [opts.maxSteps]      max tool-call iterations (default 6)
    * @param {number}   [opts.maxNewTokens]  token budget per model call (default 512)
    * @param {boolean}  [opts.verbose]       log step-by-step details
    * @param {boolean}  [opts.stream]        stream tokens to stdout / onToken
@@ -53,7 +60,8 @@ export class Agent {
     this.dtype        = opts.dtype        ?? "q4";
     this.device       = opts.device       ?? "cpu";
     this.cacheDir     = opts.cacheDir     ?? "./.cache";
-    this.maxSteps     = opts.maxSteps     ?? 8;
+    this.threads      = opts.threads      ?? 2;
+    this.maxSteps     = opts.maxSteps     ?? 6;      // reduced from 8
     this.maxNewTokens = opts.maxNewTokens ?? 512;
     this.verbose      = opts.verbose      ?? true;
     this.stream       = opts.stream       ?? false;
@@ -76,6 +84,7 @@ export class Agent {
       dtype:      this.dtype,
       device:     this.device,
       cacheDir:   this.cacheDir,
+      threads:    this.threads,
       onProgress: this.onProgress,
     });
   }
@@ -89,7 +98,9 @@ export class Agent {
     await this.load();
 
     const toolSchemas = this.tools.map((t) => t.toOpenAISchema());
-    const messages    = [
+
+    // messages is local to this call — no state bleeds between runs
+    const messages = [
       { role: "system", content: this.systemPrompt },
       { role: "user",   content: query },
     ];
@@ -111,7 +122,8 @@ export class Agent {
         return answer;
       }
 
-      log(`Step ${step + 1} — Tool Calls`, JSON.stringify(reply.tool_calls, null, 2), this.verbose);
+      log(`Step ${step + 1} — Tool Calls`,
+          JSON.stringify(reply.tool_calls, null, 2), this.verbose);
 
       for (const call of reply.tool_calls) {
         const { name, arguments: rawArgs } = call.function;
@@ -129,6 +141,7 @@ export class Agent {
         const result = await tool.run(args);
         log("Observation", result, this.verbose);
 
+        // truncate() inside toolResultMessage caps context growth
         messages.push(toolResultMessage(call.id ?? name, result));
       }
     }
@@ -146,10 +159,6 @@ export class Agent {
     };
 
     if (this.stream) {
-      // TextStreamer is imported at the top of this file — no smuggling needed.
-      // skip_special_tokens: true suppresses <|im_start|> etc.
-      // When tools are active the model may emit tool-call tokens silently;
-      // the streamer only fires on decoded text tokens.
       const streamer = new TextStreamer(this._pipe.tokenizer, {
         skip_prompt:         true,
         skip_special_tokens: true,
