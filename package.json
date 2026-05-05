@@ -1,16 +1,8 @@
 {
-  "name": "tjs-agent",
-  "version": "1.0.0",
-  "description": "Pure transformers.js v4 agent — no framework wrappers",
-  "type": "module",
+  "name": "slms",
+  "private": true,
   "scripts": {
-    "start": "node src/index.js",
-    "dev": "node --watch src/index.js"
-  },
-  "dependencies": {
-    "@huggingface/transformers": "next",
-    "zod": "^3.23.8",
-    "zod-to-json-schema": "^3.23.5"
-  },
-  "engines": { "node": ">=18" }
+    "agent":   "pnpm --filter @slms/coding-agent start",
+    "install": "pnpm install"
+  }
 }

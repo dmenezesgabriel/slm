@@ -1,0 +1,11 @@
+{
+  "name": "@slms/coding-agent",
+  "version": "0.1.0",
+  "type": "module",
+  "bin": { "coding-agent": "./src/index.js" },
+  "scripts": { "start": "node src/index.js" },
+  "dependencies": {
+    "@slms/core": "workspace:*",
+    "@slms/tui":  "workspace:*"
+  }
+}
