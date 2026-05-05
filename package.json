@@ -2,7 +2,11 @@
   "name": "slms",
   "private": true,
   "scripts": {
-    "agent":   "pnpm --filter @slms/coding-agent start",
-    "install": "pnpm install"
+    "agent": "pnpm --filter @slms/coding-agent start",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "vite": "^8.0.10",
+    "vitest": "^4.1.5"
   }
 }

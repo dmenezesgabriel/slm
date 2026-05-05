@@ -17,7 +17,7 @@
  *   THINKING_BUDGET extra thinking tokens(default: 512)
  */
 
-import { Agent } from "@slms/core";
+import { Agent, AgentSession } from "@slms/core";
 import {
   Screen, Renderer,
   Input, Loader, Markdown,
@@ -26,6 +26,7 @@ import {
   getFileCompletions, triggerFileCompletion,
 } from "@slms/tui";
 import { ReadTool, WriteTool, EditTool, BashTool } from "./tools/index.js";
+import { getCodingAgentSystemPrompt } from "./prompt.js";
 
 // ── config ────────────────────────────────────────────────────────────────────
 
@@ -240,22 +241,51 @@ const agent = new Agent({
   verbose: false,   // TUI owns all output; agent verbose logs write to stdout
                     // and corrupt the terminal rendering.
   stream:  true,
+  systemPrompt: getCodingAgentSystemPrompt(),
   tools:   [new ReadTool(), new WriteTool(), new EditTool(), new BashTool()],
-  onToken(token) {
-    streamLine += token;
-    render();
-  },
-  onStep({ reply }) {
-    // Record tool calls so they appear in the conversation while processing
-    if (reply.tool_calls?.length) {
-      for (const call of reply.tool_calls) {
-        const args = (() => {
-          try { return JSON.parse(call.function.arguments); } catch { return {}; }
-        })();
-        history.push({ role: "tool_call", content: "", meta: { name: call.function.name, args } });
+});
+
+const session = new AgentSession({ agent });
+
+const pendingToolCalls = new Map();
+
+session.subscribe((event) => {
+  if (event.type === "message") {
+    if (event.message.role === "user") {
+      history.push({ role: "user", content: event.message.content });
+    } else if (event.message.role === "assistant") {
+      streamLine = "";
+      if (event.message.tool_calls?.length) {
+        for (const call of event.message.tool_calls) {
+          const args = (() => {
+            try { return JSON.parse(call.function.arguments); } catch { return {}; }
+          })();
+          pendingToolCalls.set(call.id, call.function.name);
+          history.push({ role: "tool_call", content: "", meta: { name: call.function.name, args } });
+        }
+      } else {
+        history.push({ role: "assistant", content: event.message.content });
       }
+    } else if (event.message.role === "tool") {
+      const name = pendingToolCalls.get(event.message.tool_call_id) ?? "tool";
+      pendingToolCalls.delete(event.message.tool_call_id);
+      history.push({ role: "tool_result", content: event.message.content, meta: { name } });
     }
-  },
+    render();
+    return;
+  }
+
+  if (event.type === "token") {
+    streamLine += event.token;
+    render();
+    return;
+  }
+
+  if (event.type === "error") {
+    streamLine = "";
+    history.push({ role: "error", content: event.error.message });
+    render();
+  }
 });
 
 
@@ -263,23 +293,18 @@ const agent = new Agent({
 async function runQuery(query) {
   if (!query.trim()) return;
 
-  history.push({ role: "user", content: query });
   processing = true;
   streamLine = "";
   render();
 
   try {
-    const answer = await agent.run(query);
-
-    // Fold any tool results that were added during onStep
-    // Then add the final assistant answer
-    streamLine = "";
-    history.push({ role: "assistant", content: answer });
-  } catch (err) {
-    streamLine = "";
-    history.push({ role: "error", content: err.message });
+    await session.prompt(query);
+  } catch (_err) {
+    // AgentSession emits the error event consumed above; keep runQuery settled
+    // so fire-and-forget key handling does not create an unhandled rejection.
   } finally {
     processing = false;
+    streamLine = "";
     render();
   }
 }
@@ -294,11 +319,12 @@ function handleSlash(cmd) {
       break;
     case "clear":
       history.length = 0;
+      session.reset();
       renderer.forceFullRender();
       break;
     case "reset":
       history.length = 0;
-      // Agent keeps conversation state in run() — each run() call starts fresh.
+      session.reset();
       history.push({ role: "info", content: "Conversation cleared." });
       break;
     case "thinking":

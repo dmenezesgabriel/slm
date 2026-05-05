@@ -1,4 +1,5 @@
 export { Agent }                        from "./agent.js";
+export { AgentSession }                 from "./session.js";
 export { loadModel, resetModel }        from "./model.js";
 export { Tool }                         from "./tool.js";
 export { z }                            from "zod";

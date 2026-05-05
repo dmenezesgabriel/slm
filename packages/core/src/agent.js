@@ -142,25 +142,39 @@ export class Agent {
   }
 
   /**
-   * Run the agent on a user query.
+   * Run the agent on a user query without keeping state between calls.
    * @param {string} query
    * @returns {Promise<string>} final answer
    */
   async run(query) {
-    await this.load();
-
-    const toolSchemas = this.tools.map((t) => t.toOpenAISchema());
-
-    // messages is local to this call — no state bleeds between runs
     const messages = [
       { role: "system", content: this.systemPrompt },
       { role: "user",   content: query },
     ];
 
     log("User", query, this.verbose);
+    return this.runMessages(messages);
+  }
+
+  /**
+   * Run the agent against caller-owned chat state.
+   * The provided messages array is mutated with assistant and tool messages so
+   * session owners can persist or reuse the same model-visible context.
+   *
+   * @param {Array<{ role: string, content: any }>} messages
+   * @param {object} [callbacks]
+   * @param {Function} [callbacks.onStep]
+   * @param {Function} [callbacks.onToken]
+   * @returns {Promise<string>} final answer
+   */
+  async runMessages(messages, callbacks = {}) {
+    await this.load();
+
+    const toolSchemas = this.tools.map((t) => t.toOpenAISchema());
+    const onStep = callbacks.onStep ?? this.onStep;
 
     for (let step = 0; step < this.maxSteps; step++) {
-      const reply = await this._generate(messages, toolSchemas);
+      const reply = await this._generate(messages, toolSchemas, callbacks);
 
       // Guard against an undefined/null reply (e.g. empty generated_text
       // from an unexpected pipeline response shape).
@@ -170,7 +184,7 @@ export class Agent {
       }
 
       messages.push(reply);
-      this.onStep?.({ step, reply, messages: [...messages] });
+      onStep?.({ step, reply, messages: [...messages] });
 
       // text-only response → done
       if (!reply.tool_calls?.length) {
@@ -221,7 +235,7 @@ export class Agent {
 
   // ── private ──────────────────────────────────────────────────────────────────
 
-  async _generate(messages, toolSchemas) {
+  async _generate(messages, toolSchemas, callbacks = {}) {
     // ── tokenizer kwargs forwarded to apply_chat_template() ─────────────────
     //
     // In transformers.js 4.0.0-next.11 the pipeline spreads
@@ -275,8 +289,9 @@ export class Agent {
         callback_function:   (token) => {
           try {
             const text = typeof token === "string" ? token : String(token ?? "");
-            if (this.onToken) {
-              this.onToken(text);
+            const onToken = callbacks.onToken ?? this.onToken;
+            if (onToken) {
+              onToken(text);
             } else if (typeof process !== "undefined") {
               process.stdout.write(text);
             }
