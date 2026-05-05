@@ -156,3 +156,7 @@ for tool-call token emission. Switch with `MODEL=onnx-community/Qwen3.5-0.8B-ONN
 
 On the Lenovo C13 Yoga (8 GB RAM, Crostini), expect ~15–30 s per model call
 at `q4` / `wasm`. The `STREAM=true` flag makes the wait feel much shorter.
+
+## Interesting
+
+- https://github.com/ngxson/wllama
