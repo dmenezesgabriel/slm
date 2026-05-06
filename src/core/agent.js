@@ -70,11 +70,12 @@ function truncate(str, maxChars = 1200) {
   return str.slice(0, maxChars) + `… [truncated ${str.length - maxChars} chars]`;
 }
 
-function toolResultMessage(toolCallId, result) {
+function toolResultMessage(toolCallId, toolName, result) {
   return {
-    role:         "tool",
+    role: "tool",
+    name: toolName,
     tool_call_id: toolCallId,
-    content:      truncate(result),
+    content: truncate(result),
   };
 }
 
@@ -196,7 +197,7 @@ export class Agent {
         } catch (parseErr) {
           const msg = `Bad tool-call JSON for "${name}": ${parseErr.message}`;
           log("Tool Parse Error", msg, this.verbose);
-          messages.push(toolResultMessage(call.id ?? name, msg));
+          messages.push(toolResultMessage(call.id ?? name, name, result));
           continue;
         }
 
@@ -204,7 +205,7 @@ export class Agent {
         if (!tool) {
           const err = `Unknown tool: "${name}". Available: ${Object.keys(this._toolMap).join(", ")}`;
           log("Tool Error", err, this.verbose);
-          messages.push(toolResultMessage(call.id ?? name, err));
+          messages.push(toolResultMessage(call.id ?? name, name, result));
           continue;
         }
 
@@ -212,7 +213,7 @@ export class Agent {
         const result = await tool.run(args);
         log("Observation", result, this.verbose);
 
-        messages.push(toolResultMessage(call.id ?? name, result));
+        messages.push(toolResultMessage(call.id ?? name, name, result));
       }
     }
 
@@ -322,6 +323,40 @@ export class Agent {
     if (!raw || typeof raw.content !== "string") return raw;
 
     const content = raw.content;
+    
+    // FunctionGemma format:
+    // <start_function_call>call:calculator{expression:<escape>1+1<escape>}<end_function_call>
+    const GEMMA_CALL_RE =
+      /<start_function_call>\s*call:([a-zA-Z0-9_.$-]+)\s*\{([\s\S]*?)\}\s*<end_function_call>/g;
+
+    const gemmaMatches = [...content.matchAll(GEMMA_CALL_RE)];
+
+    if (gemmaMatches.length > 0) {
+      const tool_calls = gemmaMatches.map((m, i) => {
+        const name = m[1];
+        const argsText = m[2];
+
+        return {
+          id: `call_${i}`,
+          type: "function",
+          function: {
+            name,
+            arguments: JSON.stringify(parseFunctionGemmaArgs(argsText)),
+          },
+        };
+      });
+
+      const cleaned = content
+        .replace(GEMMA_CALL_RE, "")
+        .replace(/<start_function_response>/g, "")
+        .trim();
+
+      return {
+        role: "assistant",
+        content: cleaned,
+        tool_calls,
+      };
+    }
 
     // ── extract <tool_call>…</tool_call> blocks ──────────────────────────────
     const TOOL_CALL_RE = /<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/g;
@@ -391,4 +426,33 @@ export class Agent {
       "Be concise and accurate.",
     ].join(" ");
   }
+}
+
+
+function parseFunctionGemmaArgs(argsText) {
+  const args = {};
+
+  // Handles simple flat args like:
+  // expression:<escape>1+1<escape>,location:<escape>London<escape>
+  const ARG_RE = /([a-zA-Z0-9_.$-]+)\s*:\s*(<escape>(.*?)<escape>|[^,}]+)/g;
+
+  for (const m of argsText.matchAll(ARG_RE)) {
+    const key = m[1];
+    const value = m[3] ?? m[2];
+
+    args[key] = coerceScalar(value.trim());
+  }
+
+  return args;
+}
+
+function coerceScalar(value) {
+  if (value === "true") return true;
+  if (value === "false") return false;
+  if (value === "null") return null;
+
+  const n = Number(value);
+  if (!Number.isNaN(n) && value !== "") return n;
+
+  return value;
 }
