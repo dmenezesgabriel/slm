@@ -8,9 +8,9 @@
  *   node src/index.js "your question here"   # single query
  *
  * Env vars:
- *   MODEL            HF model id          (default: onnx-community/Qwen3-0.6B-ONNX)
+ *   MODEL            HF model id          (default: onnx-community/functiongemma-270m-it-ONNX)
  *   DTYPE            quantisation         (default: q4)
- *   DEVICE           wasm | webgpu        (default: wasm)
+ *   DEVICE           cpu | wasm | webgpu  (default: cpu)
  *   CACHE_DIR        local model cache    (default: ./.cache)
  *   MAX_STEPS        agent iterations     (default: 8)
  *   MAX_NEW_TOKENS   tokens per call      (default: 512)
@@ -35,7 +35,7 @@ import {
 // ── config ─────────────────────────────────────────────────────────────────────
 
 const CONFIG = {
-  model:           process.env.MODEL            ?? "onnx-community/Qwen3-0.6B-ONNX",
+  model:           process.env.MODEL            ?? "onnx-community/functiongemma-270m-it-ONNX",
   dtype:           process.env.DTYPE            ?? "q4",
   device:          process.env.DEVICE           ?? "cpu",
   cacheDir:        process.env.CACHE_DIR        ?? "./.cache",
@@ -88,7 +88,8 @@ async function main() {
     ],
   });
 
-  const queries = process.argv[2] ? [process.argv[2]] : DEMO_QUERIES;
+  const cliArgs = process.argv.slice(2).filter((arg) => arg !== "--");
+  const queries = cliArgs.length ? [cliArgs.join(" ")] : DEMO_QUERIES;
 
   for (const query of queries) {
     const banner = "═".repeat(70);

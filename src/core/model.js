@@ -85,6 +85,11 @@ function makeProgressCallback(onProgress) {
 // ── singleton ──────────────────────────────────────────────────────────────────
 
 let _pipe = null;
+let _pipeKey = null;
+
+function modelKey({ model, dtype, device, cacheDir, threads }) {
+  return JSON.stringify({ model, dtype, device, cacheDir, threads });
+}
 
 /**
  * Load (or return cached) the text-generation pipeline.
@@ -105,7 +110,8 @@ export async function loadModel({
   threads = 2,       // ← cap threads to prevent VM freeze on 8 GB machines
   onProgress,
 } = {}) {
-  if (_pipe) return _pipe;
+  const key = modelKey({ model, dtype, device, cacheDir, threads });
+  if (_pipe && _pipeKey === key) return _pipe;
 
   const { pipeline, env } = await import("@huggingface/transformers");
 
@@ -130,8 +136,10 @@ export async function loadModel({
       device,
       progress_callback: makeProgressCallback(onProgress),
     });
+    _pipeKey = key;
   } catch (err) {
     _pipe = null;
+    _pipeKey = null;
     throw err;
   }
 
@@ -139,7 +147,10 @@ export async function loadModel({
 }
 
 /** Reset the singleton (useful in tests or when switching models). */
-export function resetModel() { _pipe = null; }
+export function resetModel() {
+  _pipe = null;
+  _pipeKey = null;
+}
 
 /*
  * BROWSER_NOTES

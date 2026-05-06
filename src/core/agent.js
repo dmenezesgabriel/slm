@@ -4,41 +4,15 @@
  * Agent base class + agentic loop built purely on transformers.js v4.
  * No framework deps — only @huggingface/transformers + your tools.
  *
- * ── How tool-calling works in transformers.js 4.0.0-next.11 ─────────────────
+ * ── Model-specific behavior ─────────────────────────────────────────────────
  *
- * The TextGenerationPipeline does NOT natively parse tool calls.  It always
- * returns { role: 'assistant', content: <raw decoded string> }.
+ * TextGenerationPipeline returns assistant content as decoded text; tool-call
+ * markers differ by model family and may be stripped by `skip_special_tokens`.
+ * Agent delegates all model-specific prompt kwargs, token budgeting, and reply
+ * parsing to strategies selected by `createModelStrategy(model)`.
  *
- * For Qwen3 the raw string may include:
- *   - <think>…</think>          chain-of-thought block (when thinking is on)
- *   - <tool_call>…</tool_call>  one or more function calls as JSON
- *
- * Neither token is "special" in Qwen3's vocabulary
- *   (<tool_call> id=151657, </tool_call> id=151658,
- *    <think>     id=151667, </think>     id=151668  — all special=false),
- * so skip_special_tokens: true does NOT strip them — we parse them ourselves
- * in _parseReply().
- *
- * ── How tools reach the Jinja chat template ─────────────────────────────────
- *
- * In 4.0.0-next.11 the pipeline routes tokenizer_encode_kwargs directly into
- * apply_chat_template().  Passing tools there triggers the Qwen3 "tool_use"
- * template variant that renders the function schemas into the system prompt.
- *
- * ── How enable_thinking reaches the Jinja template ──────────────────────────
- *
- * apply_chat_template() forwards unknown kwargs to the Jinja renderer.
- * Qwen3's template checks:
- *
- *   {%- if enable_thinking is defined and enable_thinking is false %}
- *       {{- '<think>\n\n</think>\n\n' }}
- *   {%- endif %}
- *
- * Passing enable_thinking: false pre-fills an empty think block so the model
- * skips chain-of-thought entirely — preserving the full token budget for the
- * actual answer.  Passing enable_thinking: true (or omitting it) lets the
- * model reason before answering; thinkingBudget adds headroom for that phase
- * so the answer is never truncated by the reasoning tokens.
+ * Adding a new model family should require a new strategy + factory registry
+ * entry, not changes to the Agent loop.
  *
  * ── Streaming ────────────────────────────────────────────────────────────────
  *
@@ -50,6 +24,8 @@
 
 import { TextStreamer } from "@huggingface/transformers";
 import { loadModel } from "./model.js";
+import { createModelStrategy } from "./model-strategies/factory.js";
+import { HeuristicToolRouter } from "./tool-routing/heuristic-router.js";
 
 // ── helpers ────────────────────────────────────────────────────────────────────
 
@@ -105,9 +81,11 @@ export class Agent {
    * @param {Function} [opts.onStep]          called after every agent step
    * @param {Function} [opts.onToken]         called with each streamed token (browser)
    * @param {Function} [opts.onProgress]      called with model download progress events
+   * @param {object}   [opts.strategy]        optional model strategy override
+   * @param {object}   [opts.toolRouter]      optional high-confidence fallback tool router
    */
   constructor(opts = {}) {
-    this.model          = opts.model          ?? "onnx-community/Qwen3-0.6B-ONNX";
+    this.model          = opts.model          ?? "onnx-community/functiongemma-270m-it-ONNX";
     this.dtype          = opts.dtype          ?? "q4";
     this.device         = opts.device         ?? "cpu";
     this.cacheDir       = opts.cacheDir       ?? "./.cache";
@@ -123,7 +101,9 @@ export class Agent {
     this.onProgress     = opts.onProgress     ?? null;
     this.systemPrompt   = opts.systemPrompt   ?? this._defaultSystemPrompt();
 
-    this.tools    = opts.tools ?? [];
+    this.strategy   = opts.strategy   ?? createModelStrategy(this.model);
+    this.toolRouter = opts.toolRouter ?? new HeuristicToolRouter();
+    this.tools      = opts.tools ?? [];
     this._toolMap = Object.fromEntries(this.tools.map((t) => [t.name, t]));
     this._pipe    = null;
   }
@@ -160,6 +140,8 @@ export class Agent {
 
     log("User", query, this.verbose);
 
+    let routedFallbackUsed = false;
+
     for (let step = 0; step < this.maxSteps; step++) {
       const reply = await this._generate(messages, toolSchemas);
 
@@ -168,6 +150,24 @@ export class Agent {
       if (!reply) {
         log("Warning", "_generate returned a falsy reply — stopping", this.verbose);
         return "Model returned an empty response. Try again.";
+      }
+
+      if (!reply.tool_calls?.length && !routedFallbackUsed) {
+        const planned = this.toolRouter?.plan?.({ query, tools: this.tools, reply }) ?? [];
+        if (planned.length > 0) {
+          routedFallbackUsed = true;
+          const routedReply = { role: "assistant", content: "", tool_calls: planned };
+          log("Router Fallback", JSON.stringify(planned, null, 2), this.verbose);
+          messages.push(routedReply);
+          this.onStep?.({ step, reply: routedReply, messages: [...messages] });
+          const observations = await this._executeToolCalls(routedReply.tool_calls, messages);
+          if (this.toolRouter.shouldReturnDirect?.({ query, toolCalls: routedReply.tool_calls, observations })) {
+            const answer = observations.map((obs) => obs.result).join("\n");
+            log("Final Answer", answer, this.verbose);
+            return answer;
+          }
+          continue;
+        }
       }
 
       messages.push(reply);
@@ -182,39 +182,7 @@ export class Agent {
         return answer;
       }
 
-      log(`Step ${step + 1} — Tool Calls`,
-          JSON.stringify(reply.tool_calls, null, 2), this.verbose);
-
-      for (const call of reply.tool_calls) {
-        const { name, arguments: rawArgs } = call.function;
-
-        // JSON.parse can throw when the model hits max_new_tokens mid-generation
-        // and the JSON string is truncated.  Treat a parse failure as a tool
-        // error so the loop can recover gracefully.
-        let args;
-        try {
-          args = typeof rawArgs === "string" ? JSON.parse(rawArgs) : rawArgs;
-        } catch (parseErr) {
-          const msg = `Bad tool-call JSON for "${name}": ${parseErr.message}`;
-          log("Tool Parse Error", msg, this.verbose);
-          messages.push(toolResultMessage(call.id ?? name, name, result));
-          continue;
-        }
-
-        const tool = this._toolMap[name];
-        if (!tool) {
-          const err = `Unknown tool: "${name}". Available: ${Object.keys(this._toolMap).join(", ")}`;
-          log("Tool Error", err, this.verbose);
-          messages.push(toolResultMessage(call.id ?? name, name, result));
-          continue;
-        }
-
-        log(`Tool: ${name}`, JSON.stringify(args), this.verbose);
-        const result = await tool.run(args);
-        log("Observation", result, this.verbose);
-
-        messages.push(toolResultMessage(call.id ?? name, name, result));
-      }
+      await this._executeToolCalls(reply.tool_calls, messages, step);
     }
 
     return "Reached maximum steps without a final answer. Try a simpler question.";
@@ -222,41 +190,64 @@ export class Agent {
 
   // ── private ──────────────────────────────────────────────────────────────────
 
+  async _executeToolCalls(toolCalls, messages, step = null) {
+    const observations = [];
+
+    if (step !== null) {
+      log(`Step ${step + 1} — Tool Calls`, JSON.stringify(toolCalls, null, 2), this.verbose);
+    }
+
+    for (const call of toolCalls) {
+      const { name, arguments: rawArgs } = call.function;
+
+      // JSON.parse can throw when the model hits max_new_tokens mid-generation
+      // and the JSON string is truncated. Treat a parse failure as a tool error
+      // so the loop can recover gracefully.
+      let args;
+      try {
+        args = typeof rawArgs === "string" ? JSON.parse(rawArgs) : rawArgs;
+      } catch (parseErr) {
+        const msg = `Bad tool-call JSON for "${name}": ${parseErr.message}`;
+        log("Tool Parse Error", msg, this.verbose);
+        messages.push(toolResultMessage(call.id ?? name, name, msg));
+        observations.push({ call, name, args: null, result: msg, ok: false });
+        continue;
+      }
+
+      const tool = this._toolMap[name];
+      if (!tool) {
+        const err = `Unknown tool: "${name}". Available: ${Object.keys(this._toolMap).join(", ")}`;
+        log("Tool Error", err, this.verbose);
+        messages.push(toolResultMessage(call.id ?? name, name, err));
+        observations.push({ call, name, args, result: err, ok: false });
+        continue;
+      }
+
+      log(`Tool: ${name}`, JSON.stringify(args), this.verbose);
+      const result = await tool.run(args);
+      log("Observation", result, this.verbose);
+
+      messages.push(toolResultMessage(call.id ?? name, name, result));
+      observations.push({ call, name, args, result, ok: true });
+    }
+
+    return observations;
+  }
+
   async _generate(messages, toolSchemas) {
-    // ── tokenizer kwargs forwarded to apply_chat_template() ─────────────────
-    //
-    // In transformers.js 4.0.0-next.11 the pipeline spreads
-    // tokenizer_encode_kwargs directly into apply_chat_template(), which is
-    // the only path to pass `tools` and `enable_thinking` to the Jinja template.
-    const tokenizer_encode_kwargs = {};
-
-    if (toolSchemas.length) {
-      // Passes the function schemas into the Qwen3 "tool_use" template
-      // variant, rendering them as a <tools>…</tools> block in the prompt.
-      tokenizer_encode_kwargs.tools = toolSchemas;
-    }
-
-    if (!this.enableThinking) {
-      // Tells the Qwen3 template to pre-fill <think>\n\n</think>\n\n at the
-      // start of the assistant turn, steering the model to answer directly
-      // without generating a reasoning block — preserving the entire token
-      // budget for the actual response.
-      tokenizer_encode_kwargs.enable_thinking = false;
-    }
-
-    // When thinking is on the model consumes thinkingBudget tokens for
-    // <think>…</think> before writing the answer / tool call.  We inflate
-    // max_new_tokens by that amount so the answer is never cut short.
-    const effectiveMaxNewTokens = this.enableThinking
-      ? this.maxNewTokens + this.thinkingBudget
-      : this.maxNewTokens;
+    const tokenizer_encode_kwargs = this.strategy.getTokenizerEncodeKwargs({
+      toolSchemas,
+      enableThinking: this.enableThinking,
+    });
 
     const genOpts = {
-      max_new_tokens: effectiveMaxNewTokens,
-      do_sample:      false,
-      tokenizer_encode_kwargs: Object.keys(tokenizer_encode_kwargs).length
-        ? tokenizer_encode_kwargs
-        : undefined,
+      max_new_tokens: this.strategy.getEffectiveMaxNewTokens({
+        maxNewTokens: this.maxNewTokens,
+        enableThinking: this.enableThinking,
+        thinkingBudget: this.thinkingBudget,
+      }),
+      do_sample: false,
+      tokenizer_encode_kwargs,
     };
 
     // ── streaming ────────────────────────────────────────────────────────────
@@ -320,139 +311,15 @@ export class Agent {
    * @returns {{ role: string, content: string, tool_calls?: object[] }}
    */
   _parseReply(raw) {
-    if (!raw || typeof raw.content !== "string") return raw;
-
-    const content = raw.content;
-    
-    // FunctionGemma format:
-    // <start_function_call>call:calculator{expression:<escape>1+1<escape>}<end_function_call>
-    const GEMMA_CALL_RE =
-      /<start_function_call>\s*call:([a-zA-Z0-9_.$-]+)\s*\{([\s\S]*?)\}\s*<end_function_call>/g;
-
-    const gemmaMatches = [...content.matchAll(GEMMA_CALL_RE)];
-
-    if (gemmaMatches.length > 0) {
-      const tool_calls = gemmaMatches.map((m, i) => {
-        const name = m[1];
-        const argsText = m[2];
-
-        return {
-          id: `call_${i}`,
-          type: "function",
-          function: {
-            name,
-            arguments: JSON.stringify(parseFunctionGemmaArgs(argsText)),
-          },
-        };
-      });
-
-      const cleaned = content
-        .replace(GEMMA_CALL_RE, "")
-        .replace(/<start_function_response>/g, "")
-        .trim();
-
-      return {
-        role: "assistant",
-        content: cleaned,
-        tool_calls,
-      };
-    }
-
-    // ── extract <tool_call>…</tool_call> blocks ──────────────────────────────
-    const TOOL_CALL_RE = /<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/g;
-    const toolCallMatches = [...content.matchAll(TOOL_CALL_RE)];
-
-    if (toolCallMatches.length === 0) {
-      // Pure-text answer: strip the thinking block for a clean reply.
-      // The <think> and </think> tokens survive skip_special_tokens because
-      // they are NOT marked as special in Qwen3's tokenizer_config.json.
-      const cleaned = content
-        .replace(/<think>[\s\S]*?<\/think>\s*/g, "")
-        .trim();
-      return { ...raw, content: cleaned };
-    }
-
-    // ── parse each tool call ─────────────────────────────────────────────────
-    const tool_calls = [];
-    for (const m of toolCallMatches) {
-      try {
-        const j = JSON.parse(m[1]);
-        tool_calls.push({
-          id:   `call_${tool_calls.length}`,
-          type: "function",
-          function: {
-            name: j.name,
-            // Keep arguments as a JSON string — that is what agent.run()
-            // passes to JSON.parse() before calling Tool.run().
-            arguments: typeof j.arguments === "string"
-              ? j.arguments
-              : JSON.stringify(j.arguments),
-          },
-        });
-      } catch (_parseErr) {
-        // Malformed block: skip it.
-      }
-    }
-
-    // If every <tool_call> block failed to parse (e.g. all were truncated),
-    // fall back to treating the whole reply as plain text so run() returns
-    // something meaningful instead of an empty string.
-    if (tool_calls.length === 0) {
-      const cleaned = content
-        .replace(/<think>[\s\S]*?<\/think>\s*/g, "")
-        .trim();
-      return { ...raw, content: cleaned || content.trim() };
-    }
-
-    // Remove <tool_call> blocks from content — they are now in tool_calls.
-    // Keeping them would produce a garbled prompt when the Qwen3 template
-    // re-serialises this message on subsequent turns (it renders tool_calls
-    // independently via the {%- for tool_call in message.tool_calls %} loop).
-    const contentWithoutCalls = content
-      .replace(/<tool_call>[\s\S]*?<\/tool_call>/g, "")
-      .trimEnd();
-
-    return {
-      role:       "assistant",
-      content:    contentWithoutCalls,   // may include <think>…</think> for history
-      tool_calls,
-    };
+    return this.strategy.parseReply(raw);
   }
 
   _defaultSystemPrompt() {
     return [
       "You are a helpful AI assistant with access to tools.",
       "Use tools when they would provide a better answer than your training data.",
-      "Be concise and accurate.",
+      "For arithmetic, current date/time, weather, or Wikipedia lookups, call the matching tool instead of guessing.",
+      "After receiving a tool result, answer the user concisely and accurately.",
     ].join(" ");
   }
-}
-
-
-function parseFunctionGemmaArgs(argsText) {
-  const args = {};
-
-  // Handles simple flat args like:
-  // expression:<escape>1+1<escape>,location:<escape>London<escape>
-  const ARG_RE = /([a-zA-Z0-9_.$-]+)\s*:\s*(<escape>(.*?)<escape>|[^,}]+)/g;
-
-  for (const m of argsText.matchAll(ARG_RE)) {
-    const key = m[1];
-    const value = m[3] ?? m[2];
-
-    args[key] = coerceScalar(value.trim());
-  }
-
-  return args;
-}
-
-function coerceScalar(value) {
-  if (value === "true") return true;
-  if (value === "false") return false;
-  if (value === "null") return null;
-
-  const n = Number(value);
-  if (!Number.isNaN(n) && value !== "") return n;
-
-  return value;
 }

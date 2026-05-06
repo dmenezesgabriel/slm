@@ -16,9 +16,12 @@ zod-to-json-schema             ← Zod → OpenAI-compatible JSON Schema
 ```
 src/
 ├── core/
-│   ├── model.js    singleton pipeline loader, progress reporter, TextStreamer
-│   ├── tool.js     Tool base class (Zod schema → JSON Schema, validated run())
-│   └── agent.js    Agent class + agentic loop
+│   ├── model.js              keyed pipeline loader, progress reporter
+│   ├── tool.js               Tool base class (Zod schema → JSON Schema)
+│   ├── tool-call.js          OpenAI-style tool-call helper
+│   ├── model-strategies/     model-specific prompt kwargs + reply parsing
+│   ├── tool-routing/         high-confidence fallback routing for tiny models
+│   └── agent.js              model-agnostic agentic loop
 ├── tools/
 │   ├── calculator.js
 │   ├── datetime.js
@@ -27,21 +30,22 @@ src/
 └── index.js        demo entry point
 ```
 
-### How tool-calling works (no ReAct, no regex parsing)
+### How tool-calling works
 
-1. `Agent.run(query)` builds a `messages` array and a `toolSchemas` array from
-   `tool.toOpenAISchema()` for each registered tool.
-2. The pipeline call receives `{ tools: toolSchemas }`. The model's chat
-   template (Qwen3's `tool_use` variant) renders the tool definitions into the
-   prompt automatically.
-3. The pipeline returns `reply.tool_calls` — a structured array, no parsing
-   needed. Each entry has `{ function: { name, arguments } }`.
-4. `Agent._generate()` validates args through `Tool.run()` (Zod), executes, and
-   appends `{ role: "tool", content: result }` to `messages`.
-5. Loop repeats until `reply.tool_calls` is empty (text answer) or `maxSteps`.
-
-Everything is native to transformers.js v4. The only user-space code is the
-`for` loop in `agent.js` and the Zod validation in `tool.js`.
+1. `Agent.run(query)` builds `messages` and `toolSchemas` from each registered
+   `tool.toOpenAISchema()`.
+2. A model strategy selected by `createModelStrategy(MODEL)` decides how tools
+   and model-specific flags are forwarded to `apply_chat_template()`.
+3. The same strategy parses model-specific tool-call text back into normalized
+   OpenAI-style `{ function: { name, arguments } }` calls.
+   - FunctionGemma uses compact `call:name{...}` syntax and needs tolerant
+     parsing because transformers.js strips its function-call special tokens.
+   - Qwen uses `<tool_call>{...}</tool_call>` and optional thinking kwargs.
+4. If a very small model ignores an obvious tool request, `HeuristicToolRouter`
+   performs one high-confidence fallback call for arithmetic, date/time,
+   weather, and Wikipedia intents.
+5. `Tool.run()` validates arguments with Zod, executes the tool, and appends the
+   observation to history. The loop repeats until a final answer or `maxSteps`.
 
 ---
 
@@ -61,6 +65,8 @@ pnpm start
 
 # Single question
 node src/index.js "What is the weather in Tokyo right now?"
+# or
+pnpm start -- "What is the weather in Tokyo right now?"
 
 # Streaming tokens to stdout
 STREAM=true node src/index.js "What is 144 squared?"
@@ -70,14 +76,14 @@ STREAM=true node src/index.js "What is 144 squared?"
 
 | Variable          | Default                          | Description                     |
 |-------------------|----------------------------------|---------------------------------|
-| `MODEL`           | `onnx-community/Qwen3-0.6B-ONNX` | HF model id                     |
+| `MODEL`           | `onnx-community/functiongemma-270m-it-ONNX` | HF model id                     |
 | `DTYPE`           | `q4`                             | `q4` / `q4f16` / `fp32`        |
 | `DEVICE`          | `cpu`                            | `cpu` (ONNX/wasm) or `webgpu`  |
 | `CACHE_DIR`       | `./.cache`                       | Local model cache directory     |
 | `MAX_STEPS`       | `8`                              | Max agent iterations            |
 | `MAX_NEW_TOKENS`  | `512`                            | Answer-phase token budget       |
 | `VERBOSE`         | `true`                           | Show step-by-step logs          |
-| `STREAM`          | `false`                          | Stream tokens to stdout         |
+| `STREAM`          | `true`                           | Stream tokens to stdout         |
 | `THREADS`         | `2`                              | ONNX CPU thread count. Keep low on RAM-constrained machines. |
 | `ENABLE_THINKING` | `false`                          | Qwen3 chain-of-thought. When `false` (default) the template pre-fills an empty `<think></think>` block so the model skips reasoning and dedicates all tokens to the answer. Set `true` to keep full reasoning — `THINKING_BUDGET` tokens are added automatically so the answer is never truncated by the thinking phase. |
 | `THINKING_BUDGET` | `512`                            | Extra tokens reserved for `<think>…</think>` when `ENABLE_THINKING=true`. Raise to `1024`+ for hard multi-step problems. |
@@ -129,7 +135,7 @@ import { Agent } from "./core/agent.js";
 import { CalculatorTool } from "./tools/calculator.js";
 
 const agent = new Agent({
-  model:  "onnx-community/Qwen3-0.6B-ONNX",
+  model:  "onnx-community/functiongemma-270m-it-ONNX",
   device: "webgpu",   // GPU in browser
   dtype:  "q4f16",    // GPU-friendly quantisation
   tools:  [new CalculatorTool()],
@@ -147,15 +153,22 @@ self.onmessage = async ({ data }) => {
 
 ## Model notes
 
-`Qwen3-0.6B-ONNX` is the confirmed-working model for native tool-calling in
-transformers.js v4. Its chat template includes a `tool_use` variant that the
-pipeline selects automatically when `tools` are provided.
+The default is `onnx-community/functiongemma-270m-it-ONNX` because it is light.
+Its function-call markers are special tokens, so decoded outputs may look like
+`call:calculator{expression:...}` without wrapper tokens; this is handled by
+`FunctionGemmaStrategy`.
 
-`Qwen3.5-0.8B-ONNX` is also supported but at q4 dtype may be less reliable
-for tool-call token emission. Switch with `MODEL=onnx-community/Qwen3.5-0.8B-ONNX`.
+Qwen models are handled by `QwenStrategy`. Switch with, for example:
 
-On the Lenovo C13 Yoga (8 GB RAM, Crostini), expect ~15–30 s per model call
-at `q4` / `wasm`. The `STREAM=true` flag makes the wait feel much shorter.
+```bash
+MODEL=onnx-community/Qwen3-0.6B-ONNX node src/index.js "What is 2+2?"
+```
+
+The loader is keyed by model/dtype/device/cache settings, so changing `MODEL`
+inside the same process no longer reuses the wrong pipeline.
+
+To add another model family, implement a strategy and register it with
+`registerModelStrategy()` from `src/core/model-strategies/factory.js`.
 
 ## Interesting
 

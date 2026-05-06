@@ -41,7 +41,7 @@
 
 - https://huggingface.co/LiquidAI/LFM2.5-350M-ONNX
 - https://huggingface.co/onnx-community/Qwen3.5-0.8B-ONNX
-- https://huggingface.co/onnx-community/Qwen3-0.6B-ONNX
+- https://huggingface.co/onnx-community/functiongemma-270m-it-ONNX
 
 ## Smolagents
 
