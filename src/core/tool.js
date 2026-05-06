@@ -57,10 +57,12 @@ export class Tool {
       function: {
         name:        this.name,
         description: this.description,
+        strict:      true,
         parameters: {
           type: "object",
           properties: properties ?? {},
           required:   required   ?? [],
+          additionalProperties: false,
         },
       },
     };
@@ -75,7 +77,8 @@ export class Tool {
    * @returns {Promise<string>}
    */
   async run(rawArgs) {
-    const parsed = this.schema.safeParse(rawArgs);
+    const schema = typeof this.schema.strict === "function" ? this.schema.strict() : this.schema;
+    const parsed = schema.safeParse(rawArgs);
     if (!parsed.success) {
       return `Tool input validation error: ${parsed.error.message}`;
     }

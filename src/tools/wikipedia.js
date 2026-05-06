@@ -3,7 +3,7 @@ import { Tool } from "../core/tool.js";
 
 export class WikipediaTool extends Tool {
   name        = "wikipedia";
-  description = "Fetches a short summary about a topic from Wikipedia.";
+  description = "Use for encyclopedia-style background or summaries. Fetches a short summary about a topic from Wikipedia.";
   schema      = z.object({
     topic: z.string().describe("The Wikipedia article title or search query, e.g. 'Python programming language'"),
   });

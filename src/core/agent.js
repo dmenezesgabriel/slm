@@ -25,7 +25,6 @@
 import { TextStreamer } from "@huggingface/transformers";
 import { loadModel } from "./model.js";
 import { createModelStrategy } from "./model-strategies/factory.js";
-import { HeuristicToolRouter } from "./tool-routing/heuristic-router.js";
 
 // ── helpers ────────────────────────────────────────────────────────────────────
 
@@ -79,13 +78,14 @@ export class Agent {
    * @param {boolean}  [opts.verbose]         log step-by-step details
    * @param {boolean}  [opts.stream]          stream tokens to stdout / onToken (default true)
    * @param {Function} [opts.onStep]          called after every agent step
+   * @param {Function} [opts.onToolCall]      called for each model-emitted tool call
+   * @param {Function} [opts.onToolResult]    called after each tool execution
    * @param {Function} [opts.onToken]         called with each streamed token (browser)
    * @param {Function} [opts.onProgress]      called with model download progress events
    * @param {object}   [opts.strategy]        optional model strategy override
-   * @param {object}   [opts.toolRouter]      optional high-confidence fallback tool router
    */
   constructor(opts = {}) {
-    this.model          = opts.model          ?? "onnx-community/functiongemma-270m-it-ONNX";
+    this.model          = opts.model          ?? "onnx-community/Qwen3-0.6B-ONNX";
     this.dtype          = opts.dtype          ?? "q4";
     this.device         = opts.device         ?? "cpu";
     this.cacheDir       = opts.cacheDir       ?? "./.cache";
@@ -97,15 +97,17 @@ export class Agent {
     this.verbose        = opts.verbose        ?? true;
     this.stream         = opts.stream         ?? true;   // default ON
     this.onStep         = opts.onStep         ?? null;
+    this.onToolCall     = opts.onToolCall     ?? null;
+    this.onToolResult   = opts.onToolResult   ?? null;
     this.onToken        = opts.onToken        ?? null;
     this.onProgress     = opts.onProgress     ?? null;
     this.systemPrompt   = opts.systemPrompt   ?? this._defaultSystemPrompt();
 
-    this.strategy   = opts.strategy   ?? createModelStrategy(this.model);
-    this.toolRouter = opts.toolRouter ?? new HeuristicToolRouter();
-    this.tools      = opts.tools ?? [];
+    this.strategy = opts.strategy ?? createModelStrategy(this.model);
+    this.tools    = opts.tools ?? [];
     this._toolMap = Object.fromEntries(this.tools.map((t) => [t.name, t]));
-    this._pipe    = null;
+    this.lastTrace = null;
+    this._pipe     = null;
   }
 
   // ── public API ───────────────────────────────────────────────────────────────
@@ -128,6 +130,28 @@ export class Agent {
    * @returns {Promise<string>} final answer
    */
   async run(query) {
+    const { answer } = await this.runWithTrace(query);
+    return answer;
+  }
+
+  /**
+   * Run the agent and return an observable execution trace.
+   * @param {string} query
+   * @returns {Promise<{ answer: string, trace: object }>}
+   */
+  async runWithTrace(query) {
+    const trace = this._createTrace(query);
+    const answer = await this._run(query, trace);
+    trace.answer = answer;
+    trace.endedAt = new Date().toISOString();
+    trace.toolCalled = trace.toolCalls.length > 0;
+    this.lastTrace = trace;
+    return { answer, trace };
+  }
+
+  // ── private ──────────────────────────────────────────────────────────────────
+
+  async _run(query, trace) {
     await this.load();
 
     const toolSchemas = this.tools.map((t) => t.toOpenAISchema());
@@ -140,8 +164,6 @@ export class Agent {
 
     log("User", query, this.verbose);
 
-    let routedFallbackUsed = false;
-
     for (let step = 0; step < this.maxSteps; step++) {
       const reply = await this._generate(messages, toolSchemas);
 
@@ -152,26 +174,9 @@ export class Agent {
         return "Model returned an empty response. Try again.";
       }
 
-      if (!reply.tool_calls?.length && !routedFallbackUsed) {
-        const planned = this.toolRouter?.plan?.({ query, tools: this.tools, reply }) ?? [];
-        if (planned.length > 0) {
-          routedFallbackUsed = true;
-          const routedReply = { role: "assistant", content: "", tool_calls: planned };
-          log("Router Fallback", JSON.stringify(planned, null, 2), this.verbose);
-          messages.push(routedReply);
-          this.onStep?.({ step, reply: routedReply, messages: [...messages] });
-          const observations = await this._executeToolCalls(routedReply.tool_calls, messages);
-          if (this.toolRouter.shouldReturnDirect?.({ query, toolCalls: routedReply.tool_calls, observations })) {
-            const answer = observations.map((obs) => obs.result).join("\n");
-            log("Final Answer", answer, this.verbose);
-            return answer;
-          }
-          continue;
-        }
-      }
-
+      const stepTrace = this._recordStep(trace, step, reply);
       messages.push(reply);
-      this.onStep?.({ step, reply, messages: [...messages] });
+      this.onStep?.({ step, reply, messages: [...messages], trace });
 
       // text-only response → done
       if (!reply.tool_calls?.length) {
@@ -182,15 +187,51 @@ export class Agent {
         return answer;
       }
 
-      await this._executeToolCalls(reply.tool_calls, messages, step);
+      await this._executeToolCalls(reply.tool_calls, messages, step, trace, stepTrace);
     }
 
     return "Reached maximum steps without a final answer. Try a simpler question.";
   }
 
-  // ── private ──────────────────────────────────────────────────────────────────
+  _createTrace(query) {
+    return {
+      query,
+      model: this.model,
+      startedAt: new Date().toISOString(),
+      endedAt: null,
+      answer: null,
+      toolCalled: false,
+      steps: [],
+      toolCalls: [],
+      toolResults: [],
+    };
+  }
 
-  async _executeToolCalls(toolCalls, messages, step = null) {
+  _recordStep(trace, step, reply) {
+    const toolCalls = reply.tool_calls ?? [];
+    const stepTrace = {
+      step,
+      role: reply.role,
+      content: reply.content,
+      toolCalls,
+      toolResults: [],
+    };
+    trace.steps.push(stepTrace);
+    const callRecords = toolCalls.map((call) => ({ step, call }));
+    trace.toolCalls.push(...callRecords);
+    trace.toolCalled = trace.toolCalls.length > 0;
+    for (const record of callRecords) this.onToolCall?.(record, trace);
+    return stepTrace;
+  }
+
+  _recordToolResult(trace, stepTrace, observation) {
+    const record = { step: stepTrace?.step ?? null, ...observation };
+    trace.toolResults.push(record);
+    stepTrace?.toolResults.push(record);
+    this.onToolResult?.(record, trace);
+  }
+
+  async _executeToolCalls(toolCalls, messages, step = null, trace = null, stepTrace = null) {
     const observations = [];
 
     if (step !== null) {
@@ -210,7 +251,10 @@ export class Agent {
         const msg = `Bad tool-call JSON for "${name}": ${parseErr.message}`;
         log("Tool Parse Error", msg, this.verbose);
         messages.push(toolResultMessage(call.id ?? name, name, msg));
-        observations.push({ call, name, args: null, result: msg, ok: false });
+        const observation = { call, name, args: null, result: msg, ok: false };
+        observations.push(observation);
+        if (trace) this._recordToolResult(trace, stepTrace, observation);
+        else this.onToolResult?.(observation);
         continue;
       }
 
@@ -219,7 +263,10 @@ export class Agent {
         const err = `Unknown tool: "${name}". Available: ${Object.keys(this._toolMap).join(", ")}`;
         log("Tool Error", err, this.verbose);
         messages.push(toolResultMessage(call.id ?? name, name, err));
-        observations.push({ call, name, args, result: err, ok: false });
+        const observation = { call, name, args, result: err, ok: false };
+        observations.push(observation);
+        if (trace) this._recordToolResult(trace, stepTrace, observation);
+        else this.onToolResult?.(observation);
         continue;
       }
 
@@ -228,7 +275,10 @@ export class Agent {
       log("Observation", result, this.verbose);
 
       messages.push(toolResultMessage(call.id ?? name, name, result));
-      observations.push({ call, name, args, result, ok: true });
+      const observation = { call, name, args, result, ok: true };
+      observations.push(observation);
+      if (trace) this._recordToolResult(trace, stepTrace, observation);
+      else this.onToolResult?.(observation);
     }
 
     return observations;
@@ -316,9 +366,8 @@ export class Agent {
 
   _defaultSystemPrompt() {
     return [
-      "You are a helpful AI assistant with access to tools.",
-      "Use tools when they would provide a better answer than your training data.",
-      "For arithmetic, current date/time, weather, or Wikipedia lookups, call the matching tool instead of guessing.",
+      "You are a helpful AI assistant.",
+      "When the provided tool specification includes a tool that can answer more accurately, currently, or computationally than free-form text, call that tool.",
       "After receiving a tool result, answer the user concisely and accurately.",
     ].join(" ");
   }

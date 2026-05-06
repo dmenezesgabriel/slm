@@ -3,7 +3,7 @@ import { Tool } from "../core/tool.js";
 
 export class WeatherTool extends Tool {
   name        = "get_weather";
-  description = "Returns the current weather for a city using Open-Meteo (no API key needed).";
+  description = "Use for current weather questions. Returns the current weather for a city using Open-Meteo (no API key needed).";
   schema      = z.object({
     city: z.string().describe("City name, e.g. 'São Paulo', 'London', 'Tokyo'"),
   });

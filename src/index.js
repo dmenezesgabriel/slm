@@ -8,7 +8,7 @@
  *   node src/index.js "your question here"   # single query
  *
  * Env vars:
- *   MODEL            HF model id          (default: onnx-community/functiongemma-270m-it-ONNX)
+ *   MODEL            HF model id          (default: onnx-community/Qwen3-0.6B-ONNX)
  *   DTYPE            quantisation         (default: q4)
  *   DEVICE           cpu | wasm | webgpu  (default: cpu)
  *   CACHE_DIR        local model cache    (default: ./.cache)
@@ -16,6 +16,7 @@
  *   MAX_NEW_TOKENS   tokens per call      (default: 512)
  *   VERBOSE          true | false         (default: true)
  *   STREAM           stream tokens        (default: true)
+ *   TRACE            print tool trace     (default: false)
  *   THREADS          ONNX CPU threads     (default: 2)  — raise on machines with >8 GB RAM
  *   ENABLE_THINKING  true | false         (default: false) — Qwen3 chain-of-thought;
  *                    when true the full thinking block is available and the answer
@@ -35,7 +36,7 @@ import {
 // ── config ─────────────────────────────────────────────────────────────────────
 
 const CONFIG = {
-  model:           process.env.MODEL            ?? "onnx-community/functiongemma-270m-it-ONNX",
+  model:           process.env.MODEL            ?? "onnx-community/Qwen3-0.6B-ONNX",
   dtype:           process.env.DTYPE            ?? "q4",
   device:          process.env.DEVICE           ?? "cpu",
   cacheDir:        process.env.CACHE_DIR        ?? "./.cache",
@@ -43,6 +44,7 @@ const CONFIG = {
   maxNewTokens:    Number(process.env.MAX_NEW_TOKENS   ?? 512),
   verbose:         process.env.VERBOSE          !== "false",
   stream:          process.env.STREAM           !== "false",   // default ON
+  trace:           process.env.TRACE            === "true",
   threads:         Number(process.env.THREADS          ?? 2),
   // Qwen3 thinking mode.
   // When false (default) the Qwen3 template pre-fills <think>\n\n</think>\n\n,
@@ -98,8 +100,12 @@ async function main() {
     console.log(banner);
 
     try {
-      const answer = await agent.run(query);
+      const { answer, trace } = await agent.runWithTrace(query);
       if (CONFIG.stream) process.stdout.write("\n");
+      if (CONFIG.trace) {
+        const toolNames = trace.toolCalls.map(({ call }) => call.function?.name).filter(Boolean);
+        console.log(`[trace] toolCalled=${trace.toolCalled} tools=${toolNames.join(", ") || "none"}`);
+      }
       console.log(`\n✓ ${answer}`);
     } catch (err) {
       console.error(`✗ ERROR: ${err.message}`);
